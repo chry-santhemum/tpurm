@@ -1,0 +1,223 @@
+"""VM initialization functions."""
+
+import uuid
+import json
+import time
+import threading
+import subprocess
+
+from .common import (
+    TPU, AllocMode, ALLOCATION_MODES, REPO_ROOT,
+    _thread_local, thread_log, check_data_mount, check_env,
+    wait_for_ssh, run_cmd, gcloud_ssh, gcloud_create_tpu, gcloud_describe_tpu,
+    read_remote_script, run_remote_script,
+)
+from . import wheelhouse
+
+_TERMINAL_TPU_STATES = {"PREEMPTED", "DELETING", "TERMINATED"}
+
+
+def _is_terminal_tpu_state(state: str | None) -> bool:
+    return state in _TERMINAL_TPU_STATES
+
+
+def allocate(
+    tpu_size: str, zone: str, max_retries: int, 
+    stop_event: threading.Event|None, unpause_event: threading.Event|None,
+    mode: AllocMode="spot", owner: str="atticusw"
+) -> TPU|None:
+    """Try to allocate a TPU VM and return True if successful."""
+    mode_cfg = ALLOCATION_MODES[mode]
+    attempt = 1
+    while attempt <= max_retries:
+        if stop_event is not None and stop_event.is_set():
+            thread_log("Stop event set, aborting allocation.")
+            return None
+        if unpause_event is not None and not unpause_event.is_set():  # stall
+            if stop_event is None:
+                time.sleep(30)
+            else:
+                stop_event.wait(30)
+            continue
+
+        tpu_id = str(uuid.uuid4()).replace("-", "")[:6]
+        tpu = TPU(size=tpu_size, id=tpu_id, zone=zone, mode=mode, owner=owner)
+        thread_log(f"Trying to allocate TPU: {tpu.name} in {tpu.zone} (attempt {attempt}/{max_retries})")
+
+        result = gcloud_create_tpu(
+            tpu.name, tpu.zone,
+            tpu.config["accelerator_type"](tpu.size),
+            tpu.config["runtime_version"],
+            service_account=tpu.service_account,
+            mode_flag=mode_cfg["direct_flag"],
+        )
+        if result is None or result.returncode != 0:
+            thread_log(f"Allocation failed (attempt {attempt}/{max_retries}). Retrying in 10s.")
+            attempt += 1
+            if stop_event is None:
+                time.sleep(10)
+            else:
+                stop_event.wait(10)
+            continue
+
+        thread_log(f"Allocation successful: {tpu.name} at {tpu.zone}")
+        return tpu
+
+    thread_log(f"Error: Failed to allocate TPU {tpu.name} after {max_retries} attempts.")
+
+
+def reboot(tpu: TPU, boot_wait: int = 300) -> bool:
+    """Issue 'sudo reboot' on all workers, wait, then poll until SSH works."""
+    thread_log(f"Rebooting all workers on {tpu.name}...")
+    try:
+        result = gcloud_ssh(
+            tpu.name, tpu.zone, "sudo reboot",
+            check=False, timeout=20,
+            ssh_flags=["-o ConnectionAttempts=1", "-o ConnectTimeout=5"],
+        )
+    except subprocess.TimeoutExpired:
+        exists, state = gcloud_describe_tpu(tpu.name, tpu.zone)
+        if not exists:
+            thread_log(f"Reboot command timed out and TPU {tpu.name} no longer exists; skipping reboot wait.")
+        elif _is_terminal_tpu_state(state):
+            thread_log(f"Reboot command timed out and TPU {tpu.name} is in terminal state {state}; skipping reboot wait.")
+        else:
+            thread_log(f"Reboot command timed out for {tpu.name}; skipping reboot wait.")
+        return False
+    if not getattr(_thread_local, "dry_run", False):
+        if result is None or result.returncode != 0:
+            exists, state = gcloud_describe_tpu(tpu.name, tpu.zone)
+            if not exists:
+                thread_log(f"Reboot command failed and TPU {tpu.name} no longer exists; skipping reboot wait.")
+            elif _is_terminal_tpu_state(state):
+                thread_log(f"Reboot command failed and TPU {tpu.name} is in terminal state {state}; skipping reboot wait.")
+            else:
+                thread_log(f"Reboot command failed for {tpu.name}; skipping reboot wait.")
+            return False
+
+        thread_log(f"Restart issued. Sleeping for {boot_wait} seconds...")
+        time.sleep(boot_wait)
+    return wait_for_ssh(tpu.name, tpu.zone)
+
+
+def init_and_install(
+    tpu: TPU, *,
+    requirements_lock: str, max_retries: int, settle_time: int,
+    skip_upgrade: bool = False,
+) -> bool:
+    # Detect number of workers
+    result = run_cmd(
+        ["gcloud", "compute", "tpus", "tpu-vm", "describe",
+            tpu.name, "--zone", tpu.zone, "--format=json"],
+        capture_output=True,
+    )
+    if getattr(_thread_local, "dry_run", False):
+        n_workers = 1
+    else:
+        if result is None or result.returncode != 0:
+            thread_log(f"Error: could not describe TPU {tpu.name}.")
+            return False
+        info = json.loads(result.stdout)
+        n_workers = max(len(info.get("networkEndpoints", [])), 1)
+    thread_log(f"Detected {n_workers} worker(s)")
+
+    for attempt in range(1, max_retries + 1):
+        exists, state = gcloud_describe_tpu(tpu.name, tpu.zone)
+        if not exists:
+            thread_log(f"TPU {tpu.name} no longer exists. Aborting initialization.")
+            return False
+        if _is_terminal_tpu_state(state):
+            thread_log(f"TPU {tpu.name} entered terminal state {state}. Aborting initialization.")
+            return False
+        thread_log(f"Initialization attempt {attempt}/{max_retries}")
+        
+        # init
+        init_env = {"SKIP_UPGRADE": "1"} if skip_upgrade else {"SKIP_UPGRADE": "0"}
+        if not run_remote_script(tpu.name, tpu.zone, "init.sh", env=init_env, max_ssh_retries=3):
+            thread_log("init.sh failed. Retrying in 15s.")
+            time.sleep(15)
+            continue
+        
+        # install
+        install_success = False
+        if tpu.wheelhouse_tag and n_workers > 1:
+            if not wheelhouse.build(tpu, requirements_lock=requirements_lock):
+                thread_log("Warning: wheelhouse build failed")
+            install_success = wheelhouse.install(
+                tpu,
+                requirements_lock=requirements_lock,
+            )
+            if not install_success:
+                thread_log("Warning: wheelhouse install failed; falling back to install.sh")
+        if not install_success:
+            if not run_remote_script(tpu.name, tpu.zone, "install.sh", env={"REQUIREMENTS_LOCK": requirements_lock}, max_ssh_retries=3):
+                thread_log("install.sh failed. Retrying in 30s.")
+                time.sleep(30)
+                continue
+
+        if not getattr(_thread_local, "dry_run", False):
+            thread_log(f"Waiting {settle_time}s for environment to settle...")
+            time.sleep(settle_time)
+        if not check_env(tpu.name, tpu.zone):
+            thread_log("Warning: Env check failed. Retrying...")
+            continue
+        thread_log("Initialization successful.")
+        return True
+
+    thread_log(f"Error: Failed to initialize all workers after {max_retries} attempts")
+    return False
+
+
+def warmup(
+    tpu: TPU, *,
+    gcs_subpath: str = "data/imagenet", base: str = "imagenet",
+    tmpfs_mount: str = "/mnt/atticusw", tmpfs_size: str = "270G",
+    dest: str = "", clean_dest: bool = True,
+) -> bool:
+    gcs_prefix = f"{tpu.bucket}/{gcs_subpath}"
+    if not dest:
+        dest = f"{tmpfs_mount}/data"
+
+    thread_log(f"Target TPU VM: {tpu.name}  zone={tpu.zone}")
+    thread_log(f"GCS prefix   : {gcs_prefix}")
+    thread_log(f"Base name    : {base}")
+    thread_log(f"tmpfs mount  : {tmpfs_mount} (size={tmpfs_size})")
+    thread_log(f"Dest         : {dest}")
+
+    env_vars = " ".join([
+        f"GCS_PREFIX={gcs_prefix}",
+        f"BASE={base}",
+        f"TMPFS_MOUNT={tmpfs_mount}",
+        f"TMPFS_SIZE={tmpfs_size}",
+        f"DEST={dest}",
+        f"CLEAN_DEST={'true' if clean_dest else 'false'}",
+        f"REMOUNT_ON_CLEAN_FAIL={'true'}",
+    ])
+    script = read_remote_script("warmup.sh")
+    remote_cmd = f"{env_vars} bash -s <<'REMOTE_SCRIPT'\n{script}\nREMOTE_SCRIPT"
+    result = gcloud_ssh(tpu.name, tpu.zone, remote_cmd, worker="all", max_ssh_retries=3)
+    if getattr(_thread_local, "dry_run", False):
+        return True
+    ok = result is not None and result.returncode == 0
+    if not ok:
+        thread_log(f"WARNING: warmup failed on {tpu.name}")
+    return ok
+
+
+def ensure_ready(tpu: TPU, skip_upgrade: bool = False) -> bool:
+    """Ensure TPU has correct env and data. Returns True when ready."""
+    if not check_env(tpu.name, tpu.zone):
+        thread_log(f"Initializing {tpu.name}...")
+        if not init_and_install(
+            tpu,
+            requirements_lock=str(REPO_ROOT / "requirements.lock"),
+            max_retries=5, settle_time=180,
+            skip_upgrade=skip_upgrade,
+        ):
+            thread_log(f"init_and_install failed for {tpu.name}")
+            return False
+    if tpu.zone != "us-central2-b" and not check_data_mount(tpu.name, tpu.zone):
+        if not warmup(tpu):
+            thread_log(f"warmup failed for {tpu.name}")
+            return False
+    return True
