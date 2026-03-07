@@ -27,15 +27,15 @@ def get_zone_from_name(name: str) -> str:
 
 def scan_target(tpu_sizes: list[str], regions: list[str]) -> list[tuple[str, str]]:
     zones = []
-    family_to_chips = {}
+    family_to_chips: dict[str, set[int]] = {}
     for tpu_size in tpu_sizes:
         family, n_chips = tpu_size.split("-")
         cfg = TPU_CONFIGS[family]
-        family_to_chips[family] = int(n_chips)
+        family_to_chips.setdefault(family, set()).add(int(n_chips))
         zones.extend([z for z in cfg["allowed_zones"] if zone_to_region(z) in regions])
 
     candidates = []  # (name, zone)
-    for zone in sorted(zones):
+    for zone in sorted(set(zones)):
         vms = list_tpus(zone)
         for vm in vms:
             name = vm.get("name", "").rsplit("/", 1)[-1]
@@ -44,10 +44,10 @@ def scan_target(tpu_sizes: list[str], regions: list[str]) -> list[tuple[str, str
                 thread_log(f"[steal.py] Could not parse TPU name: {name}. Continuing.")
                 continue
             family, n_chips = tpu.size.split("-")
+            chips = int(n_chips)
             if (
                 family not in family_to_chips 
-                or int(n_chips) < family_to_chips[family]
-                or int(n_chips) > 2 * family_to_chips[family]
+                or not any(req <= chips <= 2 * req for req in family_to_chips[family])
             ):
                 continue
 

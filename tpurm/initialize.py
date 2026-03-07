@@ -1,7 +1,6 @@
 """VM initialization functions."""
 
 import uuid
-import json
 import time
 import threading
 import subprocess
@@ -9,7 +8,7 @@ import subprocess
 from .common import (
     TPU, AllocMode, ALLOCATION_MODES, REPO_ROOT,
     _thread_local, thread_log, check_data_mount, check_env,
-    wait_for_ssh, run_cmd, gcloud_ssh, gcloud_create_tpu, gcloud_describe_tpu,
+    wait_for_ssh, gcloud_ssh, gcloud_create_tpu, gcloud_describe_tpu,
     read_remote_script, run_remote_script,
 )
 from . import wheelhouse
@@ -23,22 +22,17 @@ def _is_terminal_tpu_state(state: str | None) -> bool:
 
 def allocate(
     tpu_size: str, zone: str, max_retries: int, 
-    stop_event: threading.Event|None, unpause_event: threading.Event|None,
+    stop_events: list[threading.Event],
     mode: AllocMode="spot", owner: str="atticusw"
 ) -> TPU|None:
     """Try to allocate a TPU VM and return True if successful."""
     mode_cfg = ALLOCATION_MODES[mode]
     attempt = 1
     while attempt <= max_retries:
-        if stop_event is not None and stop_event.is_set():
-            thread_log("Stop event set, aborting allocation.")
-            return None
-        if unpause_event is not None and not unpause_event.is_set():  # stall
-            if stop_event is None:
-                time.sleep(30)
-            else:
-                stop_event.wait(30)
-            continue
+        for stop_event in stop_events:
+            if stop_event.is_set():
+                thread_log("Stop event set, aborting allocation.")
+                return None
 
         tpu_id = str(uuid.uuid4()).replace("-", "")[:6]
         tpu = TPU(size=tpu_size, id=tpu_id, zone=zone, mode=mode, owner=owner)
@@ -76,7 +70,7 @@ def reboot(tpu: TPU, boot_wait: int = 300) -> bool:
             ssh_flags=["-o ConnectionAttempts=1", "-o ConnectTimeout=5"],
         )
     except subprocess.TimeoutExpired:
-        exists, state = gcloud_describe_tpu(tpu.name, tpu.zone)
+        exists, state, _ = gcloud_describe_tpu(tpu.name, tpu.zone)
         if not exists:
             thread_log(f"Reboot command timed out and TPU {tpu.name} no longer exists; skipping reboot wait.")
         elif _is_terminal_tpu_state(state):
@@ -86,7 +80,7 @@ def reboot(tpu: TPU, boot_wait: int = 300) -> bool:
         return False
     if not getattr(_thread_local, "dry_run", False):
         if result is None or result.returncode != 0:
-            exists, state = gcloud_describe_tpu(tpu.name, tpu.zone)
+            exists, state, _ = gcloud_describe_tpu(tpu.name, tpu.zone)
             if not exists:
                 thread_log(f"Reboot command failed and TPU {tpu.name} no longer exists; skipping reboot wait.")
             elif _is_terminal_tpu_state(state):
@@ -106,23 +100,21 @@ def init_and_install(
     skip_upgrade: bool = False,
 ) -> bool:
     # Detect number of workers
-    result = run_cmd(
-        ["gcloud", "compute", "tpus", "tpu-vm", "describe",
-            tpu.name, "--zone", tpu.zone, "--format=json"],
-        capture_output=True,
-    )
     if getattr(_thread_local, "dry_run", False):
         n_workers = 1
     else:
-        if result is None or result.returncode != 0:
+        exists, _, n_workers = gcloud_describe_tpu(tpu.name, tpu.zone)
+        if not exists:
             thread_log(f"Error: could not describe TPU {tpu.name}.")
             return False
-        info = json.loads(result.stdout)
-        n_workers = max(len(info.get("networkEndpoints", [])), 1)
+        if n_workers is None:
+            thread_log(f"Error: could not parse worker count for TPU {tpu.name}.")
+            return False
     thread_log(f"Detected {n_workers} worker(s)")
+    tpu.num_workers = n_workers
 
     for attempt in range(1, max_retries + 1):
-        exists, state = gcloud_describe_tpu(tpu.name, tpu.zone)
+        exists, state, _ = gcloud_describe_tpu(tpu.name, tpu.zone)
         if not exists:
             thread_log(f"TPU {tpu.name} no longer exists. Aborting initialization.")
             return False
@@ -220,4 +212,12 @@ def ensure_ready(tpu: TPU, skip_upgrade: bool = False) -> bool:
         if not warmup(tpu):
             thread_log(f"warmup failed for {tpu.name}")
             return False
+
+    # Populate num_workers here
+    if tpu.num_workers is None:
+        exists, _, n_workers = gcloud_describe_tpu(tpu.name, tpu.zone)
+        if not exists or n_workers is None:
+            thread_log(f"Could not determine num_workers for ready TPU {tpu.name}")
+            return False
+        tpu.num_workers = n_workers
     return True

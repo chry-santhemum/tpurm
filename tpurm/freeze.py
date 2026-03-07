@@ -6,6 +6,7 @@ from .common import REPO_ROOT
 
 # Packages that are conda-specific or not needed on remote TPU VMs.
 EXCLUDE = {
+    "tpurm",
     "gmpy2",
     "Brotli",
     "munkres",
@@ -21,7 +22,7 @@ EXCLUDE = {
     "setuptools",
 }
 
-if __name__ == "__main__":
+def freeze():
     result = subprocess.run(
         [sys.executable, "-m", "pip", "list", "--format=freeze"],
         capture_output=True, text=True, check=True,

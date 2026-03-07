@@ -114,6 +114,7 @@ class TPU:
     id: str           # e.g. "260817"
     zone: str         # e.g. "us-central2-b"
     name: str = field(init=False)
+    num_workers: int|None = None
 
     def __post_init__(self):
         self.name = f"kmh-tpuvm-{self.size}-{self.mode}-{self.owner}-{self.id}"
@@ -384,20 +385,25 @@ def gcloud_delete_tpu(tpu_name: str, zone: str) -> subprocess.CompletedProcess |
     ]
     return run_cmd(cmd)
 
-def gcloud_describe_tpu(tpu_name: str, zone: str) -> tuple[bool, str | None]:
-    """Return (exists, state) for TPU describe."""
+def gcloud_describe_tpu(tpu_name: str, zone: str) -> tuple[bool, str | None, int | None]:
+    """Return (exists, state, num_workers) for TPU describe."""
     cmd = [
         "gcloud", "compute", "tpus", "tpu-vm", "describe",
         tpu_name, "--zone", zone, "--format=json",
     ]
     result = run_cmd(cmd, capture_output=True)
     if result is None or result.returncode != 0:
-        return False, None
+        return False, None, None
     try:
         info = json.loads(result.stdout)
     except (TypeError, json.JSONDecodeError):
-        return True, None
-    return True, info.get("state")
+        return True, None, None
+
+    num_workers = None
+    endpoints = info.get("networkEndpoints")
+    if isinstance(endpoints, list):
+        num_workers = max(len(endpoints), 1)
+    return True, info.get("state"), num_workers
 
 
 # Helpers for monitoring TPU status

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tpurm"
 version = "0.1.0"
-dependencies = []
+dependencies = ["python-dotenv"]
 
 [project.scripts]
 tpurm = "tpurm.cli:main"
