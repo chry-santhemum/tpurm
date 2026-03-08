@@ -3,7 +3,7 @@ import time
 from pathlib import Path
 
 from .common import thread_log
-from .scheduler import FILE_STATE_DIR, Scheduler, cancel_job, submit_job
+from .scheduler import ALL_DATASETS, FILE_STATE_DIR, Scheduler, cancel_job, submit_job
 from .steal import scan_target
 from .freeze import freeze
 
@@ -21,9 +21,10 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_argument("--tpu-size", nargs="+", required=True)
     sub.add_argument("--region", nargs="+", default=None)
     sub.add_argument("--run-name", required=True)
-    sub.add_argument("--project-name", default="jax-mae")
+    sub.add_argument("--project-name", required=True)
     sub.add_argument("--command", default=None)
     sub.add_argument("--command-path", default=None)
+    sub.add_argument("--dataset", nargs="+", choices=ALL_DATASETS, default=["imagenet"])
     sub.add_argument("--priority", type=int, default=0, help="Priority of the job")
     sub.add_argument("--max-retry", type=int, default=0, help="Max number of attempts (including first run)")
 
@@ -66,6 +67,7 @@ def main(argv: list[str] | None = None) -> int:
             project_name=args.project_name,
             command=args.command,
             command_path=args.command_path,
+            datasets=args.dataset,
             state_dir=args.state_dir,
             priority=args.priority,
             max_retry=args.max_retry,

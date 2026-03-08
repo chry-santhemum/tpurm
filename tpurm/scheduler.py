@@ -13,6 +13,7 @@
 
 import contextlib
 import copy
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import fcntl
 import json
 import os
@@ -21,30 +22,35 @@ import signal
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Optional, Any, Literal
 
 from .common import (
     TPU, REPO_ROOT, TPU_CONFIGS, NFS_SSD_US,
-    thread_log, set_thread_vars, zone_to_region, name_to_tpu, size_to_family,
-    gcloud_delete_tpu, gcloud_describe_tpu, list_tpus, check_data_mount, check_vacancy,
+    _thread_local, thread_log, set_thread_vars,
+    zone_to_region, name_to_tpu, size_to_family,
+    gcloud_delete_tpu, gcloud_describe_tpu, list_tpus,
+    check_datasets_mounts, check_env, check_vacancy,
 )
 from .staging import (
     stage_code, launch, poll_launch, has_fatal_error_in_logs,
     kill_remote_processes, EXIT_CODE_FATAL, EXIT_CODE_SSH_RETRY,
 )
 from .steal import scan_target
-from .initialize import allocate, ensure_ready, reboot, check_env
+from .initialize import allocate, ensure_ready, reboot
 
 FILE_STATE_DIR = str(REPO_ROOT / ".tpurm")
 JobStatus = Literal["queued", "running", "succeeded", "failed", "cancelled", "orphaned"]
+DatasetName = Literal["imagenet", "fineweb"]
+ALL_DATASETS: tuple[DatasetName, ...] = ("imagenet", "fineweb")
 
 @dataclass
 class ManagedTPU:
     tpu: TPU
     owned: bool
     status: str   # need_init | initializing | free | busy
+    datasets_ready: dict[DatasetName, bool] = field(default_factory=dict)
 
 @dataclass
 class Job:
@@ -64,6 +70,7 @@ class Job:
     attempt: int
     priority: int  # higher is more prioritized
     log_dir: str | None = None
+    datasets: list[DatasetName] = field(default_factory=lambda: ["imagenet"])
 
     @property
     def launch_token(self) -> str:
@@ -169,7 +176,6 @@ def stage_dir_to_log_dir(stage_dir: str) -> str:
     stage_dir_suffix = stage_dir.split("/staging/")[-1]
     return f"{NFS_SSD_US}/logs/{stage_dir_suffix}"
 
-# TODO: Make the slow network requests parallelized
 def sync_tracked_tpus(file_state: FileState, startup: bool=False):
     """
     Scan and sync TPU status.
@@ -180,15 +186,15 @@ def sync_tracked_tpus(file_state: FileState, startup: bool=False):
     """
     update_status: dict[tuple[str, str], str] = {}  # (tpu_name, zone) -> status
     update_num_workers: dict[tuple[str, str], int] = {}
+    update_datasets_ready: dict[tuple[str, str], dict[DatasetName, bool]] = {}
     read_status: dict[tuple[str, str], str] = {}  # Status at snapshot time
-    owned: list[TPU] = []
+    init_states = {"initializing", "need_init"}
 
-    # Scan all the zones to find owned TPUs
+    discovered_owned: dict[tuple[str, str], TPU] = {}
     if startup:
         all_zones = set()
         for cfg in TPU_CONFIGS.values():
             all_zones.update(cfg["allowed_zones"])
-
         for zone in all_zones:
             for vm in list_tpus(zone):
                 if vm.get("state", "") != "READY":
@@ -198,64 +204,118 @@ def sync_tracked_tpus(file_state: FileState, startup: bool=False):
                 if tpu is None or tpu.owner != "atticusw":
                     continue
                 thread_log(f"Discovered owned TPU: {tpu_name} ({zone})")
-                owned.append(tpu)
+                discovered_owned[(tpu.name, tpu.zone)] = tpu
 
     _, jobs, tpus = file_state.snapshot()
+    tracked_by_key: dict[tuple[str, str], ManagedTPU] = {
+        (name, mt.tpu.zone): mt for name, mt in tpus.items()
+    }
     running_tpu_names = {
         j.assigned_tpu.name for j in jobs.values()
         if j.status == "running" and j.assigned_tpu
     }
-    for tpu_name, mt in tpus.items():
-        read_status[(tpu_name, mt.tpu.zone)] = mt.status
-    for tpu_name, mt in tpus.items():
-        key = (tpu_name, mt.tpu.zone)
-        exists = None
-        if startup:
-            exists, _, num_workers = gcloud_describe_tpu(*key)
-            if num_workers is not None:
-                update_num_workers[key] = num_workers
-        if mt.status in ["initializing", "need_init"]:
-            if exists is None:
-                exists, _, _ = gcloud_describe_tpu(*key)
-            if not exists:
-                thread_log(f"{mt.tpu.name} was preempted during initialization. Untracking.")
-                update_status[key] = "untrack"
-            continue  # Don't change the status otherwise
-        if mt.owned and (mt.tpu.name not in [t.name for t in owned]):
-            owned.append(mt.tpu)
-        # Stolen TPUs
-        elif (check_data_mount(*key) and check_env(*key)):
-            if (not check_vacancy(*key)["vacant"]) or (mt.tpu.name in running_tpu_names):
-                thread_log(f"Previously-stolen TPU {mt.tpu.name} has a mount but is busy.")
-                update_status[key] = "busy"
-            else:
-                thread_log(f"Previously-stolen TPU {mt.tpu.name} seems to be free.")
-                update_status[key] = "free"
-        else:
-            thread_log(f"Previously-stolen TPU {mt.tpu.name} doesn't have the env anymore. Untracking it.")
-            update_status[key] = "untrack"
+    read_status = {key: mt.status for key, mt in tracked_by_key.items()}
 
-    # Owned TPUs
-    for tpu in owned:
-        key = (tpu.name, tpu.zone)
-        exists, _, num_workers = gcloud_describe_tpu(*key)
-        if num_workers is not None:
-            tpu.num_workers = num_workers
-            update_num_workers[key] = num_workers
-        if not exists:
-            thread_log(f"Owned TPU {tpu.name} ({tpu.zone}) no longer exists.")
-            update_status[key] = "untrack"
-            continue
-        if tpu.name in tpus:
-            mt = tpus[tpu.name]
-            if mt.status in ["initializing", "need_init"]:
-                continue
-        if (not check_vacancy(*key)["vacant"]) or (tpu.name in running_tpu_names):
-            update_status[key] = "busy"
-        elif check_data_mount(*key) and check_env(*key):
-            update_status[key] = "free"
-        else:
-            update_status[key] = "need_init"
+    owned_targets: dict[tuple[str, str], TPU] = dict(discovered_owned)
+    for name, mt in tpus.items():
+        if mt.owned and mt.status not in init_states:
+            key = (name, mt.tpu.zone)
+            if key not in owned_targets:
+                owned_targets[key] = mt.tpu
+
+    probe_keys = set(tracked_by_key.keys()) | set(owned_targets.keys())
+
+    def probe_key(key: tuple[str, str]) -> tuple[
+        tuple[str, str],
+        str | None,
+        int | None,
+        dict[DatasetName, bool] | None,
+    ]:
+        tpu_name, zone = key
+        mt = tracked_by_key.get(key)
+        tracked = mt is not None
+        tracked_init = tracked and (mt.status in init_states)
+        owned_target = key in owned_targets
+
+        exists: bool | None = None
+        num_workers: int | None = None
+        need_describe = tracked_init or owned_target or (startup and tracked)
+        if need_describe:
+            exists, _, num_workers = gcloud_describe_tpu(tpu_name, zone)
+
+        num_workers_update: int | None = None
+        if num_workers is not None and ((startup and tracked) or owned_target):
+            num_workers_update = num_workers
+
+        datasets_ready_update: dict[DatasetName, bool] | None = None
+        should_check_datasets = False
+        if tracked and not tracked_init:
+            should_check_datasets = True
+        elif (not tracked) and owned_target and (exists is True):
+            should_check_datasets = True
+        if should_check_datasets:
+            dataset_status = check_datasets_mounts(tpu_name, zone, datasets=list(ALL_DATASETS))
+            datasets_ready_update = {
+                "imagenet": dataset_status.get("imagenet", False),
+                "fineweb": dataset_status.get("fineweb", False),
+            }
+
+        status_update: str | None = None
+        if tracked_init:
+            if exists is False:
+                thread_log(f"{tpu_name} was preempted during initialization. Untracking.")
+                status_update = "untrack"
+            return key, status_update, num_workers_update, datasets_ready_update
+
+        # Owned TPUs: occupied -> busy, else env decides free vs need_init.
+        if owned_target:
+            if exists is False:
+                thread_log(f"Owned TPU {tpu_name} ({zone}) no longer exists.")
+                status_update = "untrack"
+                return key, status_update, num_workers_update, datasets_ready_update
+            if (not check_vacancy(tpu_name, zone)["vacant"]) or (tpu_name in running_tpu_names):
+                status_update = "busy"
+            elif check_env(tpu_name, zone):
+                status_update = "free"
+            else:
+                status_update = "need_init"
+            return key, status_update, num_workers_update, datasets_ready_update
+
+        # Stolen TPUs
+        if tracked and (not mt.owned):
+            if check_env(tpu_name, zone):
+                if (not check_vacancy(tpu_name, zone)["vacant"]) or (tpu_name in running_tpu_names):
+                    thread_log(f"Previously-stolen TPU {tpu_name} is busy.")
+                    status_update = "busy"
+                else:
+                    thread_log(f"Previously-stolen TPU {tpu_name} seems to be free.")
+                    status_update = "free"
+            else:
+                thread_log(f"Previously-stolen TPU {tpu_name} doesn't have the env anymore. Untracking it.")
+                status_update = "untrack"
+            return key, status_update, num_workers_update, datasets_ready_update
+
+        return key, status_update, num_workers_update, datasets_ready_update
+
+    if probe_keys:
+        max_workers = min(32, len(probe_keys))
+        parent_log_file = getattr(_thread_local, "log_file", None)
+        parent_dry_run = getattr(_thread_local, "dry_run", False)
+
+        def probe_key_with_context(key: tuple[str, str]):
+            with set_thread_vars(log_file=parent_log_file, dry_run=parent_dry_run):
+                return probe_key(key)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(probe_key_with_context, key) for key in probe_keys]
+            for future in as_completed(futures):
+                key, status_update, num_workers_update, datasets_ready_update = future.result()
+                if status_update is not None:
+                    update_status[key] = status_update
+                if num_workers_update is not None:
+                    update_num_workers[key] = num_workers_update
+                if datasets_ready_update is not None:
+                    update_datasets_ready[key] = datasets_ready_update
 
     # Write the file state
     with file_state.transact():
@@ -264,6 +324,8 @@ def sync_tracked_tpus(file_state: FileState, startup: bool=False):
             key = (tpu_name, mt.tpu.zone)
             if key in update_num_workers:
                 mt.tpu.num_workers = update_num_workers[key]
+            if key in update_datasets_ready:
+                mt.datasets_ready = dict(update_datasets_ready[key])
             if mt.status != read_status.get(key) or key not in update_status:
                 continue
             elif update_status[key] == "untrack":
@@ -282,13 +344,19 @@ def sync_tracked_tpus(file_state: FileState, startup: bool=False):
                     continue
                 if (name, zone) in update_num_workers:
                     tpu.num_workers = update_num_workers[(name, zone)]
-                file_state._tpus[tpu.name] = ManagedTPU(tpu=tpu, owned=True, status=status)
+                file_state._tpus[tpu.name] = ManagedTPU(
+                    tpu=tpu,
+                    owned=True,
+                    status=status,
+                    datasets_ready=update_datasets_ready.get((name, zone), {}),
+                )
 
 
 def submit_job(
     tpu_size: list[str], region: list[str]|None,
     run_name: str, project_name: str,
     command: Optional[str], command_path: Optional[str],
+    datasets: list[str] | None = None,
     priority: int = 0, max_retry: int = 0,
     state_dir: Path = Path(FILE_STATE_DIR),
 ) -> int:
@@ -297,6 +365,15 @@ def submit_job(
         command = Path(command_path).read_text().strip()  # type: ignore
     if command.startswith("python "):
         raise ValueError("Use python3.13 instead of python.")
+    requested_datasets = datasets if datasets is not None else ["imagenet"]
+    normalized_datasets: list[DatasetName] = []
+    for dataset in requested_datasets:
+        if dataset == "imagenet":
+            normalized_datasets.append("imagenet")
+        elif dataset == "fineweb":
+            normalized_datasets.append("fineweb")
+        else:
+            raise ValueError(f"Unsupported dataset '{dataset}'. Expected one of: {', '.join(ALL_DATASETS)}")
     stage_dir = stage_code(run_name, project_name)
 
     fs = FileState(state_dir)
@@ -317,6 +394,7 @@ def submit_job(
             assigned_tpu=None,
             attempt=0,
             priority=priority,
+            datasets=normalized_datasets,
         )
     thread_log(f"Submitted job {job_id}: run_name={run_name}")
     return job_id
@@ -651,15 +729,26 @@ class Scheduler:
         with open(log_path, "a") as log_file, set_thread_vars(log_file=log_file):
             thread_log(f"[job {job.job_id}] Launching on {mt.tpu.name}...", force_print=True)
 
+            fs = self.file_state
+            with fs.transact():
+                tracked_job = fs._jobs[job.job_id]
+                if (
+                    tracked_job.status != "running"
+                    or tracked_job.assigned_tpu is None
+                    or tracked_job.assigned_tpu.name != mt.tpu.name
+                ):
+                    thread_log(f"[job {job.job_id}] no longer runnable before launch, skipping launch")
+                    return
+
             returncode, log_dir = launch(
                 mt.tpu, job.command, stage_dir=job.stage_dir,
-                run_name=job.run_name, project_name=job.project_name
+                run_name=job.run_name, project_name=job.project_name,
+                datasets=job.datasets,
             )
             if returncode != 0:  # Job failed to start
                 self.finalize_job(job, returncode)
                 return
             
-            fs = self.file_state
             with fs.transact():
                 tracked_job = fs._jobs[job.job_id]
                 if (
@@ -852,15 +941,10 @@ class Scheduler:
                 matched_mt.status = "busy"
                 matched_job.status = "running"
                 matched_job.assigned_tpu = matched_mt.tpu
+                matched_job.log_dir = stage_dir_to_log_dir(matched_job.stage_dir)
                 matched_job.attempt += 1
                 to_launch.append((matched_job.job_id, matched_mt.tpu.name))
         
-        if self._stop_file.exists():
-            thread_log("Stop file detected, shutting down...", force_print=True)
-            self._stop_event.set()
-        if self._stop_event.is_set():
-            return tick
-
         # Launch jobs
         for job_id, tpu_name in to_launch:
             with fs.transact():

@@ -7,9 +7,9 @@ import subprocess
 
 from .common import (
     TPU, AllocMode, ALLOCATION_MODES, REPO_ROOT,
-    _thread_local, thread_log, check_data_mount, check_env,
+    _thread_local, thread_log, check_env,
     wait_for_ssh, gcloud_ssh, gcloud_create_tpu, gcloud_describe_tpu,
-    read_remote_script, run_remote_script,
+    run_remote_script,
 )
 from . import wheelhouse
 
@@ -160,44 +160,8 @@ def init_and_install(
     return False
 
 
-def warmup(
-    tpu: TPU, *,
-    gcs_subpath: str = "data/imagenet", base: str = "imagenet",
-    tmpfs_mount: str = "/mnt/atticusw", tmpfs_size: str = "270G",
-    dest: str = "", clean_dest: bool = True,
-) -> bool:
-    gcs_prefix = f"{tpu.bucket}/{gcs_subpath}"
-    if not dest:
-        dest = f"{tmpfs_mount}/data"
-
-    thread_log(f"Target TPU VM: {tpu.name}  zone={tpu.zone}")
-    thread_log(f"GCS prefix   : {gcs_prefix}")
-    thread_log(f"Base name    : {base}")
-    thread_log(f"tmpfs mount  : {tmpfs_mount} (size={tmpfs_size})")
-    thread_log(f"Dest         : {dest}")
-
-    env_vars = " ".join([
-        f"GCS_PREFIX={gcs_prefix}",
-        f"BASE={base}",
-        f"TMPFS_MOUNT={tmpfs_mount}",
-        f"TMPFS_SIZE={tmpfs_size}",
-        f"DEST={dest}",
-        f"CLEAN_DEST={'true' if clean_dest else 'false'}",
-        f"REMOUNT_ON_CLEAN_FAIL={'true'}",
-    ])
-    script = read_remote_script("warmup.sh")
-    remote_cmd = f"{env_vars} bash -s <<'REMOTE_SCRIPT'\n{script}\nREMOTE_SCRIPT"
-    result = gcloud_ssh(tpu.name, tpu.zone, remote_cmd, worker="all", max_ssh_retries=3)
-    if getattr(_thread_local, "dry_run", False):
-        return True
-    ok = result is not None and result.returncode == 0
-    if not ok:
-        thread_log(f"WARNING: warmup failed on {tpu.name}")
-    return ok
-
-
 def ensure_ready(tpu: TPU, skip_upgrade: bool = False) -> bool:
-    """Ensure TPU has correct env and data. Returns True when ready."""
+    """Ensure TPU has correct environment. Returns True when ready."""
     if not check_env(tpu.name, tpu.zone):
         thread_log(f"Initializing {tpu.name}...")
         if not init_and_install(
@@ -207,10 +171,6 @@ def ensure_ready(tpu: TPU, skip_upgrade: bool = False) -> bool:
             skip_upgrade=skip_upgrade,
         ):
             thread_log(f"init_and_install failed for {tpu.name}")
-            return False
-    if tpu.zone != "us-central2-b" and not check_data_mount(tpu.name, tpu.zone):
-        if not warmup(tpu):
-            thread_log(f"warmup failed for {tpu.name}")
             return False
 
     # Populate num_workers here

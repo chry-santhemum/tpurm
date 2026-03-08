@@ -39,6 +39,7 @@ NFS_US = "/kmh-nfs-us-mount"
 NFS_SSD_US = "/kmh-nfs-ssd-us-mount"
 DEFAULT_SA_KEY_FILE: str = os.getenv("DEFAULT_SA_KEY_FILE")  # type: ignore
 DEFAULT_KEYS_DIR: str = os.getenv("DEFAULT_KEYS_DIR")  # type: ignore
+SUPPORTED_DATASETS: tuple[str, ...] = ("imagenet", "fineweb")
 
 
 # TPU configuration
@@ -418,7 +419,14 @@ def check_env(tpu_name: str, zone: str) -> bool:
         ("JAX/Flax import", "python3.13 -c 'import jax; import flax' 2>/dev/null"),
     ]
     for name, cmd in checks:
-        result = gcloud_ssh(tpu_name, zone, cmd, worker="all", check=False)
+        result = gcloud_ssh(
+            tpu_name,
+            zone,
+            cmd,
+            worker="all",
+            check=False,
+            max_ssh_retries=2,
+        )
         if result is None or result.returncode != 0:
             thread_log(f"Environment check failed: {name}")
             return False
@@ -426,30 +434,49 @@ def check_env(tpu_name: str, zone: str) -> bool:
     return True
 
 
-def check_data_mount(tpu_name: str, zone: str) -> bool:
+def check_datasets_mounts(tpu_name: str, zone: str, datasets: list[str] | None = None) -> dict[str, bool]:
     """
-    Check if TPU has the mounted imagenet data directory.
-    Returns False if SSH timed out.
+    Check mount presence for multiple datasets.
     """
+    target_datasets = datasets or list(SUPPORTED_DATASETS)
+    for dataset in target_datasets:
+        if dataset not in SUPPORTED_DATASETS:
+            raise ValueError(f"Unsupported dataset '{dataset}'. Expected one of: {', '.join(SUPPORTED_DATASETS)}")
+    script = read_remote_script("warmup.sh")
+    remote_cmd = f"ACTION=check_all bash -s <<'REMOTE_SCRIPT'\n{script}\nREMOTE_SCRIPT"
+
     try:
         result = gcloud_ssh(
             tpu_name, zone,
-            "test -d /mnt/atticusw/data/imagenet && echo YES || echo NO",
+            remote_cmd,
             worker="0", timeout=30, capture_output=True,
         )
     except subprocess.TimeoutExpired:
         thread_log(f"  {tpu_name}: SSH timed out")
-        return False
+        return {dataset: False for dataset in target_datasets}
+
     if getattr(_thread_local, "dry_run", False):
-        return True
-    return (result is not None and result.returncode == 0 and "YES" in result.stdout)
+        return {dataset: True for dataset in target_datasets}
+
+    if result is None or result.returncode != 0:
+        return {dataset: False for dataset in target_datasets}
+
+    parsed: dict[str, bool] = {dataset: False for dataset in SUPPORTED_DATASETS}
+    for line in result.stdout.splitlines():
+        if "=" not in line:
+            continue
+        dataset, value = line.strip().split("=", 1)
+        if dataset in parsed:
+            parsed[dataset] = (value == "1")
+
+    return {dataset: parsed.get(dataset, False) for dataset in target_datasets}
 
 def check_vacancy(tpu_name: str, zone: str, timeout: float = 30) -> dict:
     """
     SSH into worker 0 and check if TPU is in use.
     vacant=None means SSH failed.
     """
-    info = {"name": tpu_name, "vacant": None, "load": ""}
+    info: dict[str, Any] = {"name": tpu_name, "vacant": None, "load": ""}
     cmd = (
         "lsof /dev/accel* 2>/dev/null || true; "
         "echo ---MARKER---; "

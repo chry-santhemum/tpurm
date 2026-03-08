@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import dotenv
 import random
+import shlex
 import string
 import subprocess
 import sys
@@ -14,6 +15,7 @@ from .common import TPU, REPO_ROOT, NFS_SSD_US, thread_log, run_cmd, gcloud_ssh
 
 dotenv.load_dotenv(Path.home() / ".env")
 WANDB_KEY = os.getenv("WANDB_KEY")
+ALL_DATASETS = ("imagenet", "fineweb")
 
 
 def stage_code(run_name: str, project_name: str, retain=False, stage_root_dir=NFS_SSD_US) -> str:
@@ -74,6 +76,7 @@ def kill_remote_processes(tpu_name: str, zone: str):
         "sudo pkill -15 python || true\n"
         "sleep 2\n"
         "sudo pkill -9 python || true\n"
+        "sudo pkill -9 -f 'tpurm_warmup_occupy.py|warmup.sh|gcloud storage|zstd|pv|tar -C' || true\n"
         "sudo fuser -k 8476/tcp >/dev/null 2>&1 || true\n"
         "sudo fuser -k /dev/vfio/0 >/dev/null 2>&1 || true\n"
         "sudo rm -rf /tmp/libtpu_lockfile /tmp/tpu_logs /tmp/*tpu* || true\n"
@@ -86,12 +89,63 @@ def kill_remote_processes(tpu_name: str, zone: str):
     gcloud_ssh(tpu_name, zone, cmd)
 
 
-def launch(tpu: TPU, command: str, run_name: str, project_name: str, stage_dir: str) -> tuple[int, str]:
+def _dataset_warmup_block(tpu: TPU, datasets: list[str] | None) -> str:
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    raw = datasets or []
+    for dataset in ("imagenet", "fineweb"):
+        if dataset in raw:
+            ordered.append(dataset)
+            seen.add(dataset)
+    for dataset in raw:
+        if dataset in seen:
+            continue
+        raise ValueError(f"Unsupported dataset '{dataset}'. Expected one of: {', '.join(ALL_DATASETS)}")
+
+    if not ordered:
+        return "echo '[worker] no dataset warmup requested'"
+
+    lines = [
+        'WARMUP_SCRIPT="tpurm/remote/warmup.sh"',
+        'if [ ! -f "$WARMUP_SCRIPT" ]; then echo "[worker] ERROR: missing $WARMUP_SCRIPT" >&2; exit 10; fi',
+    ]
+    for dataset in ordered:
+        gcs_subpath = "data/imagenet" if dataset == "imagenet" else "data/fineweb"
+        gcs_prefix = f"{tpu.bucket}/{gcs_subpath}"
+        clean_dest = "false" if dataset == "imagenet" else "true"
+        lines.extend([
+            f'echo "[worker] ensuring dataset {dataset}..."',
+            (
+                f'if ACTION=check DATASET={shlex.quote(dataset)} bash "$WARMUP_SCRIPT" | grep -q YES; then\n'
+                f'  echo "[worker] dataset {dataset} already present"\n'
+                'else\n'
+                f'  ACTION=warmup DATASET={shlex.quote(dataset)} '
+                f'GCS_PREFIX={shlex.quote(gcs_prefix)} BASE=imagenet FINEWEB_SUFFIX=bin '
+                f'TMPFS_MOUNT=/mnt/atticusw TMPFS_SIZE=270G CLEAN_DEST={clean_dest} REMOUNT_ON_CLEAN_FAIL=true '
+                'bash "$WARMUP_SCRIPT"\n'
+                f'  if ! ACTION=check DATASET={shlex.quote(dataset)} bash "$WARMUP_SCRIPT" | grep -q YES; then\n'
+                f'    echo "[worker] ERROR: dataset {dataset} still missing after warmup" >&2\n'
+                '    exit 11\n'
+                '  fi\n'
+                'fi'
+            ),
+        ])
+    return "\n".join(lines)
+
+
+def launch(
+    tpu: TPU,
+    command: str,
+    run_name: str,
+    project_name: str,
+    stage_dir: str,
+    datasets: list[str] | None = None,
+) -> tuple[int, str]:
     """
     Dispatch a command on all TPU VM workers and return immediately.
 
-    The command string may contain the strings 
-    `{log_dir}`, `{run_name}`, or `{project_name}`
+    The command string may contain the strings `{log_dir}`, `{run_name}`, or `{project_name}`
     which will be replaced with the corresponding arguments.
     """
     stage_dir_suffix = stage_dir.split("/staging/")[-1]
@@ -122,6 +176,7 @@ def launch(tpu: TPU, command: str, run_name: str, project_name: str, stage_dir: 
         """
     ).strip()
     thread_log(f"Remote local workdir: {local_work_dir}")
+    dataset_block = _dataset_warmup_block(tpu, datasets)
 
     runner_script_path = f"~/{launch_token}.sh"
     runner_script = textwrap.dedent(
@@ -141,6 +196,7 @@ def launch(tpu: TPU, command: str, run_name: str, project_name: str, stage_dir: 
         trap 'rc=$?; echo "$rc" > "$EXIT_FILE"' EXIT
 
         {workdir_block}
+        {dataset_block}
 
         set +e
         stdbuf -oL -eL {real_command} 2>&1 | tee "$WORKER_LOG"
@@ -155,6 +211,7 @@ def launch(tpu: TPU, command: str, run_name: str, project_name: str, stage_dir: 
         log_dir=log_dir,
         launch_token=launch_token,
         workdir_block=workdir_block,
+        dataset_block=dataset_block,
         real_command=real_command,
     )
 
