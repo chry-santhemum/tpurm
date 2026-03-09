@@ -2,15 +2,15 @@
 
 # Expects env vars set by caller:
 #   ACTION=check|check_all|warmup
-#   DATASET=imagenet|fineweb
-#   GCS_PREFIX, BASE, FINEWEB_SUFFIX, TMPFS_MOUNT, TMPFS_SIZE, DEST,
+#   DATASET=imagenet|fineweb10B
+#   GCS_PREFIX, BASE, FINEWEB10B_SUFFIX, TMPFS_MOUNT, TMPFS_SIZE, DEST,
 #   CLEAN_DEST, REMOUNT_ON_CLEAN_FAIL
 
 set -euo pipefail
 
 ACTION="${ACTION:-warmup}"
 DATASET="${DATASET:-imagenet}"
-FINEWEB_SUFFIX="${FINEWEB_SUFFIX:-bin}"
+FINEWEB10B_SUFFIX="${FINEWEB10B_SUFFIX:-bin}"
 TMPFS_MOUNT="${TMPFS_MOUNT:-/mnt/atticusw}"
 TMPFS_SIZE="${TMPFS_SIZE:-270G}"
 CLEAN_DEST="${CLEAN_DEST:-true}"
@@ -28,8 +28,8 @@ dataset_mount_path_for() {
     imagenet)
       echo "/mnt/atticusw/data/imagenet"
       ;;
-    fineweb)
-      echo "/mnt/atticusw/data/fineweb"
+    fineweb10B)
+      echo "/mnt/atticusw/data/fineweb10B"
       ;;
     *)
       echo "[worker] ERROR: unsupported dataset '$dataset_name'" >&2
@@ -50,7 +50,7 @@ run_check() {
 
 
 run_check_all() {
-  for dataset_name in imagenet fineweb; do
+  for dataset_name in imagenet fineweb10B; do
     target="$(dataset_mount_path_for "$dataset_name")"
     if test -d "$target"; then
       echo "__TPURM_DATASET_STATUS__ ${dataset_name}=1"
@@ -104,7 +104,7 @@ run_body() {
     if [ "$DATASET" = "imagenet" ]; then
       DEST="${TMPFS_MOUNT}/data"
     else
-      DEST="${TMPFS_MOUNT}/data/fineweb"
+      DEST="${TMPFS_MOUNT}/data/fineweb10B"
     fi
   fi
 
@@ -211,19 +211,19 @@ run_body() {
     else
       gcloud storage cat "${PARTS[@]}" | pv -ptebar | tar -C "$RAMROOT" -xf -
     fi
-  elif [ "$DATASET" = "fineweb" ]; then
+  elif [ "$DATASET" = "fineweb10B" ]; then
     if [ -z "${GCS_PREFIX:-}" ]; then
-      echo "[worker] ERROR: GCS_PREFIX is required for fineweb warmup" >&2
+      echo "[worker] ERROR: GCS_PREFIX is required for fineweb10B warmup" >&2
       exit 2
     fi
-    echo "[worker] downloading fineweb *.${FINEWEB_SUFFIX} files from ${GCS_PREFIX} to ${RAMROOT}"
-    timeout 600s gcloud storage cp "${GCS_PREFIX}/*.${FINEWEB_SUFFIX}" "$RAMROOT/" && ret=0 || ret=$?
+    echo "[worker] downloading fineweb10B *.${FINEWEB10B_SUFFIX} files from ${GCS_PREFIX} to ${RAMROOT}"
+    timeout 600s gcloud storage cp "${GCS_PREFIX}/*.${FINEWEB10B_SUFFIX}" "$RAMROOT/" && ret=0 || ret=$?
     if [ "$ret" -ne 0 ]; then
       echo "[worker] ERROR: gcloud storage cp failed with code $ret" >&2
       exit 27
     fi
-    num_files=$(ls "$RAMROOT"/*."${FINEWEB_SUFFIX}" 2>/dev/null | wc -l)
-    echo "[worker] downloaded ${num_files} fineweb files"
+    num_files=$(ls "$RAMROOT"/*."${FINEWEB10B_SUFFIX}" 2>/dev/null | wc -l)
+    echo "[worker] downloaded ${num_files} fineweb10B files"
   else
     echo "[worker] ERROR: unsupported dataset '$DATASET'" >&2
     exit 2
@@ -239,7 +239,7 @@ if [ "$EUID" -ne 0 ] && [ "$ACTION" = "warmup" ]; then
   echo "[worker] not running as root, rerunning with sudo..."
   sudo \
     ACTION="$ACTION" DATASET="$DATASET" \
-    GCS_PREFIX="${GCS_PREFIX:-}" BASE="${BASE:-}" FINEWEB_SUFFIX="$FINEWEB_SUFFIX" \
+    GCS_PREFIX="${GCS_PREFIX:-}" BASE="${BASE:-}" FINEWEB10B_SUFFIX="$FINEWEB10B_SUFFIX" \
     TMPFS_MOUNT="$TMPFS_MOUNT" TMPFS_SIZE="$TMPFS_SIZE" \
     DEST="${DEST:-}" CLEAN_DEST="$CLEAN_DEST" \
     REMOUNT_ON_CLEAN_FAIL="$REMOUNT_ON_CLEAN_FAIL" \

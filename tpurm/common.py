@@ -17,6 +17,7 @@ from contextlib import contextmanager
 
 dotenv.load_dotenv(Path.home() / ".env")
 _thread_local = threading.local()
+_THREAD_VAR_MISSING = object()
 
 # TODO: change "size" to "type"
 
@@ -39,7 +40,7 @@ NFS_US = "/kmh-nfs-us-mount"
 NFS_SSD_US = "/kmh-nfs-ssd-us-mount"
 DEFAULT_SA_KEY_FILE: str = os.getenv("DEFAULT_SA_KEY_FILE")  # type: ignore
 DEFAULT_KEYS_DIR: str = os.getenv("DEFAULT_KEYS_DIR")  # type: ignore
-DatasetName = Literal["imagenet", "fineweb"]
+DatasetName = Literal["imagenet", "fineweb10B"]
 SUPPORTED_DATASETS = list(get_args(DatasetName))
 
 # TPU configuration
@@ -104,7 +105,7 @@ ALLOCATION_MODES: dict[AllocMode, dict[str, str]] = {
 }
 
 _LOG_MAX_BYTES = 5 * 1024 * 1024
-_LOG_ROTATE_CHECK_EVERY = 1000
+_LOG_ROTATE_CHECK_EVERY = 200
 
 
 @dataclass
@@ -181,13 +182,22 @@ def name_to_tpu(name: str, zone: str) -> TPU | None:
 
 @contextmanager
 def set_thread_vars(**kwargs):
+    prev_values = {}
     for k, v in kwargs.items():
+        prev_values[k] = getattr(_thread_local, k, _THREAD_VAR_MISSING)
         setattr(_thread_local, k, v)
     try:
         yield
     finally:
         for k in kwargs:
-            setattr(_thread_local, k, None)
+            prev = prev_values[k]
+            if prev is _THREAD_VAR_MISSING:
+                try:
+                    delattr(_thread_local, k)
+                except AttributeError:
+                    pass
+            else:
+                setattr(_thread_local, k, prev)
 
 def _maybe_rotate_log(f):
     try:
@@ -325,58 +335,76 @@ def gcloud_ssh(
     ssh_log_path = REPO_ROOT / ".tpurm" / "logs" / "gcloud_ssh.log"
     ssh_log_path.parent.mkdir(parents=True, exist_ok=True)
     captured: list[str] = []
-    retry_count = 0  # Number of "Retrying:" lines seen.
-    retry_exhausted = False
-    started_at = time.monotonic()
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
 
-    try:
-        assert proc.stdout is not None
+    def _normalize_output(output: str | bytes | None) -> str:
+        if output is None:
+            return ""
+        if isinstance(output, bytes):
+            return output.decode(errors="replace")
+        return output
+
+    def _append_ssh_log(output: str):
+        if not output:
+            return
         with open(ssh_log_path, "a") as ssh_log:
-            for line in proc.stdout:
-                if capture_output:
-                    captured.append(line)
-                ssh_log.write(line)
-                ssh_log.flush()
-                _bump_log_rotation_check(ssh_log)
+            ssh_log.write(output)
+            if not output.endswith("\n"):
+                ssh_log.write("\n")
+            ssh_log.flush()
+            _bump_log_rotation_check(ssh_log)
 
-                if "Retrying:" in line:
-                    retry_count += 1
-                    if retry_count >= max_ssh_tries:
-                        thread_log(
-                            f"SSH attempt limit reached ({max_ssh_tries}); TPU likely preempted"
-                        )
-                        proc.kill()
-                        retry_exhausted = True
-                        break
-                if timeout is not None and (time.monotonic() - started_at) > timeout:
-                    raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout, output="".join(captured))
-        proc.wait()
-    finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait()
+    attempts = max(1, max_ssh_tries)
+    for attempt in range(1, attempts + 1):
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            output = _normalize_output(proc.stdout)
+        except subprocess.TimeoutExpired as exc:
+            output = _normalize_output(exc.stdout)
+            _append_ssh_log(output)
+            if capture_output and output:
+                captured.append(output)
+            if attempt < attempts:
+                thread_log(
+                    f"SSH command timed out after {timeout}s "
+                    f"(attempt {attempt}/{attempts}); retrying..."
+                )
+                continue
+            thread_log(
+                f"SSH command timed out after {timeout}s "
+                f"(attempt {attempt}/{attempts})"
+            )
+            thread_log(f"SSH attempt limit reached ({attempts}); TPU likely preempted")
+            return SSHResult(status="ssh_retry_exhausted", returncode=-1, stdout="".join(captured))
 
-    stdout = "".join(captured)
-    if retry_exhausted:
-        return SSHResult(
-            status="ssh_retry_exhausted",
-            returncode=-1,
-            stdout=stdout,
-        )
+        _append_ssh_log(output)
+        if capture_output and output:
+            captured.append(output)
 
-    returncode = proc.returncode if proc.returncode is not None else 1
-    return SSHResult(
-        status="ok" if returncode == 0 else "error",
-        returncode=returncode,
-        stdout=stdout,
-    )
+        returncode = proc.returncode if proc.returncode is not None else 1
+        if returncode == 0:
+            return SSHResult(status="ok", returncode=0, stdout="".join(captured))
+
+        # gcloud ssh returns 255 for transport/auth failures; retry those.
+        if returncode == 255 and attempt < attempts:
+            thread_log(
+                f"SSH command failed with return code 255 "
+                f"(attempt {attempt}/{attempts}); retrying..."
+            )
+            continue
+        if returncode == 255:
+            thread_log(f"SSH attempt limit reached ({attempts}); TPU likely preempted")
+            return SSHResult(status="ssh_retry_exhausted", returncode=-1, stdout="".join(captured))
+        return SSHResult(status="error", returncode=returncode, stdout="".join(captured))
+
+    # Unreachable, but keeps type checkers happy.
+    return SSHResult(status="ssh_retry_exhausted", returncode=-1, stdout="".join(captured))
 
 
 def read_remote_script(name: str) -> str:
@@ -549,7 +577,7 @@ def check_datasets_mounts(tpu_name: str, zone: str, timeout: float = 15, max_ssh
     mounted_ds: list[DatasetName] = []
     for line in result.stdout.splitlines():
         parsed = re.fullmatch(
-            r"(?:__TPURM_DATASET_STATUS__ )?(imagenet|fineweb)=([01])",
+            r"(?:__TPURM_DATASET_STATUS__ )?(imagenet|fineweb10B)=([01])",
             line.strip(),
         )
         if parsed is None:
@@ -560,7 +588,7 @@ def check_datasets_mounts(tpu_name: str, zone: str, timeout: float = 15, max_ssh
         if dataset == "imagenet":
             mounted_ds.append("imagenet")
         else:
-            mounted_ds.append("fineweb")
+            mounted_ds.append("fineweb10B")
 
     return mounted_ds
 
@@ -592,13 +620,23 @@ def check_vacancy(tpu_name: str, zone: str, timeout: float = 15, max_ssh_tries: 
         return
 
     parts = result.stdout.split("---MARKER---")
-    accel_output = parts[0].strip() if len(parts) > 0 else ""
+    raw_accel_output = parts[0].strip() if len(parts) > 0 else ""
     python_output = parts[1].strip() if len(parts) > 1 else ""
     load_output = parts[2].strip() if len(parts) > 2 else ""
 
-    if python_output != "":
-        python_examples = "\n".join(python_output.split("\n")[:4])
-        thread_log(f"  {tpu_name}: python process examples:\n{python_examples}")
+    # Ignore gcloud SSH preamble chatter and only keep real lsof hits.
+    accel_lines = [line for line in raw_accel_output.splitlines() if "/dev/accel" in line]
+    accel_output = "\n".join(accel_lines).strip()
+    
+    tpu = name_to_tpu(tpu_name, zone)
+    if tpu is not None and tpu.owner == "atticusw":
+        if python_output != "":
+            python_examples = "\n".join(python_output.split("\n")[:1])
+            thread_log(f"  {tpu_name}: python process example:\n{python_examples}")
+        if accel_output != "":
+            accel_examples = "\n".join(accel_output.split("\n")[:3])
+            thread_log(f"  {tpu_name}: accel process examples:\n{accel_examples}")
+        thread_log(f"  {tpu_name}: load output:\n{load_output}")
 
     load_1m = float(load_output.split()[0]) if load_output else 999.0
     load_5m = float(load_output.split()[1]) if load_output else 999.0

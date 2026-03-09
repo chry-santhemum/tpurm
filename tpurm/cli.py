@@ -80,7 +80,6 @@ def main(argv: list[str] | None = None) -> int:
     elif args.action == "freeze":
         freeze()
     elif args.action == "start":
-        freeze()
         scheduler = Scheduler(
             alloc_max=args.alloc_max,
             alloc_sizes=args.alloc_sizes,

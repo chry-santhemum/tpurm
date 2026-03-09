@@ -11,11 +11,11 @@ import sys
 import textwrap
 import time
 
-from .common import TPU, DatasetName, REPO_ROOT, NFS_SSD_US, thread_log, run_cmd, gcloud_ssh
+from .common import TPU, DatasetName, REPO_ROOT, NFS_SSD_US, thread_log, run_cmd, gcloud_ssh, read_remote_script
 
 dotenv.load_dotenv(Path.home() / ".env")
 WANDB_KEY = os.getenv("WANDB_KEY")
-ALL_DATASETS = ("imagenet", "fineweb")
+ALL_DATASETS = ("imagenet", "fineweb10B")
 
 
 def stage_code(run_name: str, project_name: str, retain=False, stage_root_dir=NFS_SSD_US) -> str:
@@ -44,9 +44,34 @@ def stage_code(run_name: str, project_name: str, retain=False, stage_root_dir=NF
         ["git", "ls-files", "-co", "--exclude-standard"],
         cwd=str(REPO_ROOT), capture_output=True, text=True, check=True,
     )
+    raw_paths = [p for p in git_files.stdout.splitlines() if p]
+    expanded_paths: list[str] = []
+    seen: set[str] = set()
+    for rel_path in raw_paths:
+        src_path = REPO_ROOT / rel_path
+        if src_path.is_symlink() and src_path.is_dir():
+            prefix = rel_path.rstrip("/")
+            for sub_path in src_path.rglob("*"):
+                if not sub_path.is_file():
+                    continue
+                if "__pycache__" in sub_path.parts:
+                    continue
+                staged_subpath = f"{prefix}/{sub_path.relative_to(src_path).as_posix()}"
+                if staged_subpath in seen:
+                    continue
+                seen.add(staged_subpath)
+                expanded_paths.append(staged_subpath)
+            continue
+
+        if rel_path in seen:
+            continue
+        seen.add(rel_path)
+        expanded_paths.append(rel_path)
+
+    files_from_input = "\n".join(expanded_paths) + ("\n" if expanded_paths else "")
     result = run_cmd(
         ["rsync", "-aL", "--files-from=-", str(REPO_ROOT) + "/", stage_dir],  # materialize symlinked files
-        input=git_files.stdout, text=True,
+        input=files_from_input, text=True,
     )
     if result is None or result.returncode != 0:
         print(f"ERROR: rsync failed (exit code {result.returncode if result else 'N/A'})", file=sys.stderr)
@@ -86,7 +111,15 @@ def kill_remote_processes(tpu_name: str, zone: str):
         "  sleep 3\n"
         "done\n"
     )
-    result = gcloud_ssh(tpu_name, zone, cmd, worker="all", timeout=None, capture_output=False, max_ssh_tries=2)
+    result = gcloud_ssh(
+        tpu_name,
+        zone,
+        cmd,
+        worker="all",
+        timeout=20,
+        capture_output=False,
+        max_ssh_tries=2,
+    )
     if not result.ok:
         if result.ssh_retry_exhausted:
             thread_log(f"Failed to kill remote processes on {tpu_name}: SSH retries exhausted (TPU likely preempted)")
@@ -98,12 +131,9 @@ def _dataset_warmup_block(tpu: TPU, datasets: list[DatasetName] | None) -> str:
     if not datasets:
         return "echo '[worker] no dataset warmup requested'"
 
-    lines = [
-        'WARMUP_SCRIPT="tpurm/remote/warmup.sh"',
-        'if [ ! -f "$WARMUP_SCRIPT" ]; then echo "[worker] ERROR: missing $WARMUP_SCRIPT" >&2; exit 10; fi',
-    ]
+    lines = []
     for dataset in datasets:
-        gcs_subpath = "data/imagenet" if dataset == "imagenet" else "data/fineweb"
+        gcs_subpath = "data/imagenet" if dataset == "imagenet" else "data/fineweb10B"
         gcs_prefix = f"{tpu.bucket}/{gcs_subpath}"
         clean_dest = "false" if dataset == "imagenet" else "true"
         lines.extend([
@@ -113,7 +143,7 @@ def _dataset_warmup_block(tpu: TPU, datasets: list[DatasetName] | None) -> str:
                 f'  echo "[worker] dataset {dataset} already present"\n'
                 'else\n'
                 f'  ACTION=warmup DATASET={shlex.quote(dataset)} '
-                f'GCS_PREFIX={shlex.quote(gcs_prefix)} BASE=imagenet FINEWEB_SUFFIX=bin '
+                f'GCS_PREFIX={shlex.quote(gcs_prefix)} BASE=imagenet FINEWEB10B_SUFFIX=bin '
                 f'TMPFS_MOUNT=/mnt/atticusw TMPFS_SIZE=270G CLEAN_DEST={clean_dest} REMOUNT_ON_CLEAN_FAIL=true '
                 'bash "$WARMUP_SCRIPT"\n'
                 f'  if ! ACTION=check DATASET={shlex.quote(dataset)} bash "$WARMUP_SCRIPT" | grep -q YES; then\n'
@@ -157,7 +187,7 @@ def launch(
         project_name=project_name,
     )
 
-    # Clean up leftover processes before launching
+    # Clean up leftover processes before launching (best-effort).
     kill_remote_processes(tpu.name, tpu.zone)
     
     # Build command for each worker
@@ -173,6 +203,24 @@ def launch(
     ).strip()
     thread_log(f"Remote local workdir: {local_work_dir}")
     dataset_block = _dataset_warmup_block(tpu, datasets)
+    if datasets:
+        warmup_script_path = f"/tmp/tpurm_warmup_{launch_token}.sh"
+        warmup_heredoc_tag = f"TPURM_WARMUP_{launch_token}"
+        warmup_setup_block = textwrap.dedent(
+            """\
+            WARMUP_SCRIPT={warmup_script_path}
+            cat > "$WARMUP_SCRIPT" <<'{warmup_heredoc_tag}'
+            {warmup_script}
+            {warmup_heredoc_tag}
+            chmod +x "$WARMUP_SCRIPT"
+            """
+        ).format(
+            warmup_script_path=shlex.quote(warmup_script_path),
+            warmup_heredoc_tag=warmup_heredoc_tag,
+            warmup_script=read_remote_script("warmup.sh"),
+        ).strip()
+    else:
+        warmup_setup_block = "true"
 
     runner_script_path = f"~/{launch_token}.sh"
     runner_script = textwrap.dedent(
@@ -192,6 +240,7 @@ def launch(
         trap 'rc=$?; echo "$rc" > "$EXIT_FILE"' EXIT
 
         {workdir_block}
+        {warmup_setup_block}
         {dataset_block}
 
         set +e
@@ -207,6 +256,7 @@ def launch(
         log_dir=log_dir,
         launch_token=launch_token,
         workdir_block=workdir_block,
+        warmup_setup_block=warmup_setup_block,
         dataset_block=dataset_block,
         real_command=real_command,
     )
