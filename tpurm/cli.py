@@ -2,8 +2,8 @@ import argparse
 import time
 from pathlib import Path
 
-from .common import thread_log
-from .scheduler import ALL_DATASETS, FILE_STATE_DIR, Scheduler, cancel_job, submit_job
+from .common import thread_log, SUPPORTED_DATASETS
+from .scheduler import FILE_STATE_DIR, Scheduler, cancel_job, submit_job
 from .steal import scan_target
 from .freeze import freeze
 
@@ -24,7 +24,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_argument("--project-name", required=True)
     sub.add_argument("--command", default=None)
     sub.add_argument("--command-path", default=None)
-    sub.add_argument("--dataset", nargs="+", choices=ALL_DATASETS, default=["imagenet"])
+    sub.add_argument("--dataset", nargs="+", choices=SUPPORTED_DATASETS, default=["imagenet"])
     sub.add_argument("--priority", type=int, default=0, help="Priority of the job")
     sub.add_argument("--max-retry", type=int, default=0, help="Max number of attempts (including first run)")
 
@@ -70,7 +70,7 @@ def main(argv: list[str] | None = None) -> int:
             datasets=args.dataset,
             state_dir=args.state_dir,
             priority=args.priority,
-            max_retry=args.max_retry,
+            max_att=args.max_att,
         )
     elif args.action == "cancel":
         cancel_job(args.job_id, state_dir=args.state_dir)

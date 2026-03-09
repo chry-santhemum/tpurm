@@ -53,9 +53,9 @@ run_check_all() {
   for dataset_name in imagenet fineweb; do
     target="$(dataset_mount_path_for "$dataset_name")"
     if test -d "$target"; then
-      echo "${dataset_name}=1"
+      echo "__TPURM_DATASET_STATUS__ ${dataset_name}=1"
     else
-      echo "${dataset_name}=0"
+      echo "__TPURM_DATASET_STATUS__ ${dataset_name}=0"
     fi
   done
 }
@@ -110,43 +110,37 @@ run_body() {
 
   echo "[worker] $(hostname): preparing for $DATASET warmup..."
 
-  # install dependencies with robust apt handling
-  export DEBIAN_FRONTEND=noninteractive
-  APT_RETRIES=${APT_RETRIES:-20}
-
-  # Aggressively stop and disable apt auto-update services
-  sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service || true
-  sudo systemctl disable apt-daily.timer apt-daily-upgrade.timer || true
-  sudo systemctl mask unattended-upgrades.service apt-daily.service apt-daily-upgrade.service || true
-  sudo pkill -9 unattended-upgrade || true
-  sudo pkill -9 apt.systemd.daily || true
-
-  # Clear stale locks and fix interrupted dpkg
-  sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock
-  sudo dpkg --configure -a || true
-
-  ret=1
-  for attempt in $(seq 1 "$APT_RETRIES"); do
-    echo "[worker] apt install attempt $attempt/$APT_RETRIES"
-    sudo apt-get -y install zstd pv >/dev/null && ret=0 || ret=$?
-    if [ "$ret" -eq 0 ]; then
-      break
-    fi
-    echo '[worker] apt install failed, cleaning up and retrying...'
-    (
-      sudo systemctl stop unattended-upgrades || true
-      sudo killall unattended-upgrade || true
+  # Ensure stream/decompression tools exist; skip apt entirely on already-initialized TPUs.
+  missing_tools=()
+  command -v pv >/dev/null 2>&1 || missing_tools+=("pv")
+  command -v zstd >/dev/null 2>&1 || missing_tools+=("zstd")
+  if [ "${#missing_tools[@]}" -gt 0 ]; then
+    export DEBIAN_FRONTEND=noninteractive
+    APT_RETRIES=${APT_RETRIES:-20}
+    ret=1
+    sudo dpkg --configure -a || true
+    sudo apt-get -y update >/dev/null || true
+    for attempt in $(seq 1 "$APT_RETRIES"); do
+      echo "[worker] apt install attempt $attempt/$APT_RETRIES for ${missing_tools[*]}"
+      sudo apt-get -y install "${missing_tools[@]}" >/dev/null && ret=0 || ret=$?
+      if [ "$ret" -eq 0 ]; then
+        break
+      fi
+      echo '[worker] apt install failed, cleaning stale locks and retrying...'
       for f in /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock; do
-        sudo kill -9 $(sudo lsof -t "$f" 2>/dev/null) 2>/dev/null || true
+        pids="$(sudo lsof -t "$f" 2>/dev/null || true)"
+        if [ -n "$pids" ]; then
+          sudo kill -9 $pids >/dev/null 2>&1 || true
+        fi
       done
       sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock || true
       sudo dpkg --configure -a || true
-    ) || true
-    sleep 5
-  done
-  if [ "$ret" -ne 0 ]; then
-    echo '[worker] ERROR: apt installation failed after retries' >&2
-    exit 7
+      sleep 5
+    done
+    if [ "$ret" -ne 0 ]; then
+      echo '[worker] ERROR: apt installation failed after retries' >&2
+      exit 7
+    fi
   fi
 
   # mount tmpfs
@@ -241,7 +235,7 @@ run_body() {
 }
 
 
-if [ "$EUID" -ne 0 ]; then
+if [ "$EUID" -ne 0 ] && [ "$ACTION" = "warmup" ]; then
   echo "[worker] not running as root, rerunning with sudo..."
   sudo \
     ACTION="$ACTION" DATASET="$DATASET" \

@@ -85,15 +85,15 @@ def scan_target(tpu_sizes: list[str], regions: list[str]) -> list[tuple[str, str
     vacant_vms = []
     for name, zone in candidates:
         info = results[(name, zone)]
-        if info["vacant"] is None:
-            status_str = "???"
-        elif info["vacant"]:
+        if info is None:
+            status_str = "dead"
+        elif info[0]:
             status_str = "YES"
         else:
             status_str = "no"
-        load = info["load"].split()[0] if info["load"] else "?"
+        load = info[1].split()[0] if info is not None else "?"
         thread_log(f"{name:<55} {zone:<20} {status_str:<10} {load}")
-        if info["vacant"]:
+        if info is not None and info[0]:
             vacant_vms.append((name, zone))
     
     return vacant_vms

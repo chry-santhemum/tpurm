@@ -2,7 +2,6 @@ import hashlib
 import shlex
 from .common import (
     TPU, DEFAULT_KEYS_DIR, DEFAULT_SA_KEY_FILE,
-    _thread_local,
     gcloud_ssh, thread_log, read_remote_script, run_cmd,
 )
 
@@ -39,8 +38,6 @@ def tarball_exists(tpu: TPU, requirements_hash: str) -> bool:
     uri = f"{tpu.bucket}/atticusw/wheelhouse/wheelhouse_{tpu.wheelhouse_tag}_{requirements_hash}.tar.gz"
     thread_log(f"Checking if tarball exists: {uri}")
     result = run_cmd(["gcloud", "storage", "ls", uri])
-    if getattr(_thread_local, "dry_run", False):
-        return True
     return result is not None and result.returncode == 0
 
 
@@ -56,10 +53,10 @@ def build(tpu: TPU, requirements_lock: str, wheelhouse_dir: str="") -> bool:
     preamble = read_remote_script("wheelhouse_preamble.sh")
     body = read_remote_script("wheelhouse_build.sh")
     full_cmd = f"{env} bash -s <<'REMOTE'\n" + preamble + '\n' + body + "\nREMOTE"
-    result = gcloud_ssh(tpu.name, tpu.zone, full_cmd, worker="0")
-    if getattr(_thread_local, "dry_run", False):
-        return True
-    return result is not None and result.returncode == 0
+    result = gcloud_ssh(tpu.name, tpu.zone, full_cmd, worker="0", timeout=None, capture_output=False, max_ssh_tries=3)
+    if result.ssh_retry_exhausted:
+        thread_log(f"Wheelhouse build SSH retries exhausted on {tpu.name} (TPU likely preempted)")
+    return result.ok
 
 
 def install(tpu: TPU, requirements_lock: str, wheelhouse_dir: str="") -> bool:
@@ -70,7 +67,7 @@ def install(tpu: TPU, requirements_lock: str, wheelhouse_dir: str="") -> bool:
     preamble = read_remote_script("wheelhouse_preamble.sh")
     body = read_remote_script("wheelhouse_install.sh")
     full_cmd = f"{env} bash -s <<'REMOTE'\n" + preamble + '\n' + body + "\nREMOTE"
-    result = gcloud_ssh(tpu.name, tpu.zone, full_cmd, worker="all")
-    if getattr(_thread_local, "dry_run", False):
-        return True
-    return result is not None and result.returncode == 0
+    result = gcloud_ssh(tpu.name, tpu.zone, full_cmd, worker="all", timeout=None, capture_output=False, max_ssh_tries=3)
+    if result.ssh_retry_exhausted:
+        thread_log(f"Wheelhouse install SSH retries exhausted on {tpu.name} (TPU likely preempted)")
+    return result.ok

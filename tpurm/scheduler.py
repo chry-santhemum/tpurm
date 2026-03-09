@@ -27,54 +27,59 @@ from pathlib import Path
 from typing import Optional, Any, Literal
 
 from .common import (
-    TPU, REPO_ROOT, TPU_CONFIGS, NFS_SSD_US,
+    TPU, DatasetName,
+    REPO_ROOT, TPU_CONFIGS, NFS_SSD_US, SUPPORTED_DATASETS,
     _thread_local, thread_log, set_thread_vars,
     zone_to_region, name_to_tpu, size_to_family,
     gcloud_delete_tpu, gcloud_describe_tpu, list_tpus,
     check_datasets_mounts, check_env, check_vacancy,
 )
 from .staging import (
-    stage_code, launch, poll_launch, has_fatal_error_in_logs,
+    stage_code, launch, poll_launch, stage_dir_to_log_dir, has_fatal_error_in_logs,
     kill_remote_processes, EXIT_CODE_FATAL, EXIT_CODE_SSH_RETRY,
 )
 from .steal import scan_target
 from .initialize import allocate, ensure_ready, reboot
 
 FILE_STATE_DIR = str(REPO_ROOT / ".tpurm")
-JobStatus = Literal["queued", "running", "succeeded", "failed", "cancelled", "orphaned"]
-DatasetName = Literal["imagenet", "fineweb"]
-ALL_DATASETS: tuple[DatasetName, ...] = ("imagenet", "fineweb")
+# I think this might be too complicated
+JobStatus = Literal["queued", "matched", "running", "succeeded", "failed", "cancelled", "orphaned"]
+
 
 @dataclass
 class ManagedTPU:
     tpu: TPU
     owned: bool
     status: str   # need_init | initializing | free | busy
-    datasets_ready: dict[DatasetName, bool] = field(default_factory=dict)
+    datasets: list[DatasetName] = field(default_factory=list)
 
 @dataclass
 class Job:
-    # Properties known at creation time (should not be changed)
+    # Immutable properties, known at creation time
     job_id: int
     created_at: float
     command: str
-    stage_dir: str
     tpu_size: list[str]
     region: list[str] | None
+    datasets: list[DatasetName]
     run_name: str
     project_name: str
-    max_retry: int  # max attempts (0 means one execution attempt)
-    # Mutable properties
-    status: JobStatus
+    max_att: int
+    priority: int  # higher is more prioritized
+    # Mutable properties, updated for each launch
+    stage_dir: str
     assigned_tpu: TPU | None  # last assigned
     attempt: int
-    priority: int  # higher is more prioritized
-    log_dir: str | None = None
-    datasets: list[DatasetName] = field(default_factory=lambda: ["imagenet"])
+    # State
+    status: JobStatus
 
     @property
     def launch_token(self) -> str:
         return self.stage_dir.split("/")[-1].split("__")[-2]
+    @property
+    def log_dir(self) -> str:
+        return stage_dir_to_log_dir(self.stage_dir)
+
 
 def _deserialize(d: Any):
     # convenience for loading file state
@@ -172,25 +177,15 @@ def tpu_matches_job(tpu: TPU, job: Job) -> bool:
     return False
 
 
-def stage_dir_to_log_dir(stage_dir: str) -> str:
-    stage_dir_suffix = stage_dir.split("/staging/")[-1]
-    return f"{NFS_SSD_US}/logs/{stage_dir_suffix}"
+def sync_state(file_state: FileState, startup: bool=False):
+    # We first do a read, and only change the TPUs whose status remain the same
+    read_status: dict[tuple[str, str], str] = {}  # key -> status
+    # Keys for which to do all the checks
+    check_all = []
+    # Updated fields
+    updates: dict[tuple[str, str], dict[str, Any]] = {}  # key -> update
+    update_factory = {"status": None, "num_workers": None, "datasets": None}
 
-def sync_tracked_tpus(file_state: FileState, startup: bool=False):
-    """
-    Scan and sync TPU status.
-    Only modifies the file_state._tpus dict.
-
-    Args:
-        startup: If true, scan all zones to check for TPUs with my name.
-    """
-    update_status: dict[tuple[str, str], str] = {}  # (tpu_name, zone) -> status
-    update_num_workers: dict[tuple[str, str], int] = {}
-    update_datasets_ready: dict[tuple[str, str], dict[DatasetName, bool]] = {}
-    read_status: dict[tuple[str, str], str] = {}  # Status at snapshot time
-    init_states = {"initializing", "need_init"}
-
-    discovered_owned: dict[tuple[str, str], TPU] = {}
     if startup:
         all_zones = set()
         for cfg in TPU_CONFIGS.values():
@@ -203,153 +198,87 @@ def sync_tracked_tpus(file_state: FileState, startup: bool=False):
                 tpu = name_to_tpu(tpu_name, zone)
                 if tpu is None or tpu.owner != "atticusw":
                     continue
+                key = (tpu.name, tpu.zone)
+                updates[key] = copy.deepcopy(update_factory)
+                check_all.append(key)
                 thread_log(f"Discovered owned TPU: {tpu_name} ({zone})")
-                discovered_owned[(tpu.name, tpu.zone)] = tpu
 
     _, jobs, tpus = file_state.snapshot()
-    tracked_by_key: dict[tuple[str, str], ManagedTPU] = {
-        (name, mt.tpu.zone): mt for name, mt in tpus.items()
-    }
-    running_tpu_names = {
-        j.assigned_tpu.name for j in jobs.values()
-        if j.status == "running" and j.assigned_tpu
-    }
-    read_status = {key: mt.status for key, mt in tracked_by_key.items()}
-
-    owned_targets: dict[tuple[str, str], TPU] = dict(discovered_owned)
     for name, mt in tpus.items():
-        if mt.owned and mt.status not in init_states:
-            key = (name, mt.tpu.zone)
-            if key not in owned_targets:
-                owned_targets[key] = mt.tpu
+        key = (name, mt.tpu.zone)
+        read_status[key] = mt.status
+        updates[key] = copy.deepcopy(update_factory)
+        if startup:
+            check_all.append(key)
+        thread_log(f"Read status {key}: {mt.status}")
+    # always mark TPUs with known running jobs as busy
+    keys_with_running_jobs = []
+    for job in jobs.values():
+        if job.status == "running" and job.assigned_tpu is not None:
+            keys_with_running_jobs.append((job.assigned_tpu.name, job.assigned_tpu.zone))
+    
+    if len(updates) == 0:
+        return
 
-    probe_keys = set(tracked_by_key.keys()) | set(owned_targets.keys())
-
-    def probe_key(key: tuple[str, str]) -> tuple[
-        tuple[str, str],
-        str | None,
-        int | None,
-        dict[DatasetName, bool] | None,
-    ]:
+    def sync_one(key: tuple[str, str]):
         tpu_name, zone = key
-        mt = tracked_by_key.get(key)
-        tracked = mt is not None
-        tracked_init = tracked and (mt.status in init_states)
-        owned_target = key in owned_targets
-
-        exists: bool | None = None
-        num_workers: int | None = None
-        need_describe = tracked_init or owned_target or (startup and tracked)
-        if need_describe:
+        out = updates[key]
+        if (key in check_all) or (read_status[key] in ["need_init", "initializing"]):
             exists, _, num_workers = gcloud_describe_tpu(tpu_name, zone)
-
-        num_workers_update: int | None = None
-        if num_workers is not None and ((startup and tracked) or owned_target):
-            num_workers_update = num_workers
-
-        datasets_ready_update: dict[DatasetName, bool] | None = None
-        should_check_datasets = False
-        if tracked and not tracked_init:
-            should_check_datasets = True
-        elif (not tracked) and owned_target and (exists is True):
-            should_check_datasets = True
-        if should_check_datasets:
-            dataset_status = check_datasets_mounts(tpu_name, zone, datasets=list(ALL_DATASETS))
-            datasets_ready_update = {
-                "imagenet": dataset_status.get("imagenet", False),
-                "fineweb": dataset_status.get("fineweb", False),
-            }
-
-        status_update: str | None = None
-        if tracked_init:
-            if exists is False:
-                thread_log(f"{tpu_name} was preempted during initialization. Untracking.")
-                status_update = "untrack"
-            return key, status_update, num_workers_update, datasets_ready_update
-
-        # Owned TPUs: occupied -> busy, else env decides free vs need_init.
-        if owned_target:
-            if exists is False:
-                thread_log(f"Owned TPU {tpu_name} ({zone}) no longer exists.")
-                status_update = "untrack"
-                return key, status_update, num_workers_update, datasets_ready_update
-            if (not check_vacancy(tpu_name, zone)["vacant"]) or (tpu_name in running_tpu_names):
-                status_update = "busy"
-            elif check_env(tpu_name, zone):
-                status_update = "free"
+            if num_workers is not None:
+                out["num_workers"] = num_workers
+            if not exists:
+                out["status"] = "untrack"
             else:
-                status_update = "need_init"
-            return key, status_update, num_workers_update, datasets_ready_update
-
-        # Stolen TPUs
-        if tracked and (not mt.owned):
-            if check_env(tpu_name, zone):
-                if (not check_vacancy(tpu_name, zone)["vacant"]) or (tpu_name in running_tpu_names):
-                    thread_log(f"Previously-stolen TPU {tpu_name} is busy.")
-                    status_update = "busy"
+                out["status"] = read_status.get(key, None)  # will be filled later
+        if (key in check_all) or (read_status[key] not in ["need_init", "initializing"]):
+            out["datasets"] = check_datasets_mounts(tpu_name, zone, max_ssh_tries=1)
+            vacant_ok = check_vacancy(tpu_name, zone, max_ssh_tries=1)
+            if vacant_ok is None:
+                out["status"] = "untrack"
+            elif not vacant_ok[0] or (key in keys_with_running_jobs):
+                out["status"] = "busy"
+            else:
+                env_ok = check_env(tpu_name, zone, max_ssh_tries=1)
+                if env_ok is None:
+                    out["status"] = "untrack"
+                elif env_ok:
+                    out["status"] = "free"
                 else:
-                    thread_log(f"Previously-stolen TPU {tpu_name} seems to be free.")
-                    status_update = "free"
-            else:
-                thread_log(f"Previously-stolen TPU {tpu_name} doesn't have the env anymore. Untracking it.")
-                status_update = "untrack"
-            return key, status_update, num_workers_update, datasets_ready_update
+                    out["status"] = "need_init"
+    
+    parent_log_file = getattr(_thread_local, "log_file", None)
+    def sync_one_with_context(key: tuple[str, str]) -> dict[str, Any]:
+        with set_thread_vars(log_file=parent_log_file):
+            return sync_one(key)
+    
+    with ThreadPoolExecutor(max_workers=min(32, len(updates))) as executor:
+        futures = [executor.submit(sync_one_with_context, key) for key in updates.keys()]
+        for fut in as_completed(futures):
+            fut.result()
 
-        return key, status_update, num_workers_update, datasets_ready_update
-
-    if probe_keys:
-        max_workers = min(32, len(probe_keys))
-        parent_log_file = getattr(_thread_local, "log_file", None)
-        parent_dry_run = getattr(_thread_local, "dry_run", False)
-
-        def probe_key_with_context(key: tuple[str, str]):
-            with set_thread_vars(log_file=parent_log_file, dry_run=parent_dry_run):
-                return probe_key(key)
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(probe_key_with_context, key) for key in probe_keys]
-            for future in as_completed(futures):
-                key, status_update, num_workers_update, datasets_ready_update = future.result()
-                if status_update is not None:
-                    update_status[key] = status_update
-                if num_workers_update is not None:
-                    update_num_workers[key] = num_workers_update
-                if datasets_ready_update is not None:
-                    update_datasets_ready[key] = datasets_ready_update
-
-    # Write the file state
     with file_state.transact():
-        to_untrack = set()
-        for tpu_name, mt in file_state._tpus.items():
-            key = (tpu_name, mt.tpu.zone)
-            if key in update_num_workers:
-                mt.tpu.num_workers = update_num_workers[key]
-            if key in update_datasets_ready:
-                mt.datasets_ready = dict(update_datasets_ready[key])
-            if mt.status != read_status.get(key) or key not in update_status:
+        for key, out in updates.items():
+            if out["status"] is None:
+                thread_log(f"Status is None for {key}, meaning sync_one failed for that TPU.")
                 continue
-            elif update_status[key] == "untrack":
-                to_untrack.add(tpu_name)
-            else:
-                mt.status = update_status[key]
-        for tpu_name in to_untrack:
-            del file_state._tpus[tpu_name]
-
-        # Add TPUs not in the file state
-        tracked_names = list(file_state._tpus.keys())
-        for (name, zone), status in update_status.items():
-            if name not in tracked_names and status != "untrack":
-                tpu = name_to_tpu(name, zone)
-                if tpu is None:
-                    continue
-                if (name, zone) in update_num_workers:
-                    tpu.num_workers = update_num_workers[(name, zone)]
-                file_state._tpus[tpu.name] = ManagedTPU(
+            if key[0] not in file_state._tpus and out["status"] != "untrack":
+                tpu = name_to_tpu(key[0], key[1])
+                assert tpu is not None
+                if out["num_workers"] is not None:
+                    tpu.num_workers = out["num_workers"]
+                file_state._tpus[key[0]] = ManagedTPU(
                     tpu=tpu,
                     owned=True,
-                    status=status,
-                    datasets_ready=update_datasets_ready.get((name, zone), {}),
+                    status=out["status"],
+                    datasets=out["datasets"] or [],
                 )
+                continue
+            if out["status"] == "untrack":
+                file_state._tpus.pop(key[0], None)
+            elif file_state._tpus[key[0]].status == read_status[key]:
+                # Only update when status has not been changed since read
+                file_state._tpus[key[0]].status = out["status"]
 
 
 def submit_job(
@@ -357,7 +286,7 @@ def submit_job(
     run_name: str, project_name: str,
     command: Optional[str], command_path: Optional[str],
     datasets: list[str] | None = None,
-    priority: int = 0, max_retry: int = 0,
+    priority: int = 0, max_att: int = 0,
     state_dir: Path = Path(FILE_STATE_DIR),
 ) -> int:
     assert (command_path is None) ^ (command is None), "Exactly one of command and command_path must be provided"
@@ -373,7 +302,7 @@ def submit_job(
         elif dataset == "fineweb":
             normalized_datasets.append("fineweb")
         else:
-            raise ValueError(f"Unsupported dataset '{dataset}'. Expected one of: {', '.join(ALL_DATASETS)}")
+            raise ValueError(f"Unsupported dataset '{dataset}'. Expected one of: {', '.join(SUPPORTED_DATASETS)}")
     stage_dir = stage_code(run_name, project_name)
 
     fs = FileState(state_dir)
@@ -389,7 +318,7 @@ def submit_job(
             region=region,
             run_name=run_name,
             project_name=project_name,
-            max_retry=max_retry,
+            max_att=max_att,
             status="queued",
             assigned_tpu=None,
             attempt=0,
@@ -417,40 +346,26 @@ def kill_local_processes(tpu_name: str):
         except (ValueError, ProcessLookupError):
             pass
 
-# TODO: Place cancelled jobs in a queue to kill by the scheduler only
 def cancel_job(job_id: int, state_dir: Path = Path(FILE_STATE_DIR)):
     fs = FileState(state_dir)
 
-    tpu_to_kill = None
     with fs.transact():
         if job_id not in fs._jobs:
             thread_log(f"Job {job_id} not found.")
             return
         job = fs._jobs[job_id]
         if job.status == "queued":
+            job.assigned_tpu = None
             job.status = "cancelled"
             thread_log(f"Cancelled queued job {job_id}")
             return
         elif job.status == "running":
-            tpu_to_kill = job.assigned_tpu
             job.status = "cancelled"
+            thread_log(f"Marked running job {job_id} as cancelled; scheduler will terminate it.")
+            return
         else:
             thread_log(f"Job {job_id} is already {job.status}, nothing to cancel.")
             return
-
-    if tpu_to_kill:
-        thread_log(f"Killing processes for job {job_id} on {tpu_to_kill.name}...")
-        kill_local_processes(tpu_to_kill.name)
-        kill_remote_processes(tpu_to_kill.name, tpu_to_kill.zone)
-        with fs.transact():
-            job = fs._jobs.get(job_id)
-            if job is not None:
-                job.assigned_tpu = None
-            mt = fs._tpus.get(tpu_to_kill.name)
-            if mt is not None:
-                mt.status = "free"
-            
-        thread_log(f"Cancelled running job {job_id}")
 
 
 
@@ -497,18 +412,17 @@ class Scheduler:
 
     def startup(self):
         fs = self.file_state
-        sync_tracked_tpus(fs, startup=True)
+        sync_state(fs, startup=True)
 
         with fs.transact():
             for tpu_name, mt in fs._tpus.items():
                 if mt.status == "initializing":
                     thread_log(f"Resetting stuck initializing TPU {tpu_name} to need_init")
                     mt.status = "need_init"
-            for job in fs._jobs.values():
-                if job.status == "running" and job.log_dir is None:
-                    job.log_dir = stage_dir_to_log_dir(job.stage_dir)
 
         self.poll_jobs()
+        self.drain_cancelled_jobs()
+        sync_state(fs)
 
 
     def try_alloc(self, worker_id: int, size: str, zone: str) -> bool:
@@ -550,6 +464,9 @@ class Scheduler:
                     assert zone is not None  # for type check
                     curr_pointer = 0
                 else:
+                    if len(default_combo) == 0:
+                        self._stop_event.wait(30)
+                        continue
                     size, zone = default_combo[curr_pointer]
                     curr_pointer = (curr_pointer + 1) % len(default_combo)
                 
@@ -617,22 +534,24 @@ class Scheduler:
     # Helpers
 
     def match_tpu(self, job: Job, tpus: dict[str, ManagedTPU], exclude: set[str] | None = None) -> str | None:
-        """Match a job to a free TPU, preferring owned over stolen."""
+        """Match a job to a free TPU, preferring dataset-ready then owned TPUs."""
         if exclude is None:
             exclude = set()
-        # Owned
+        candidates: list[tuple[tuple[int, int, str], str]] = []
         for tpu_name, mt in tpus.items():
-            if mt.status != "free" or not mt.owned or tpu_name in exclude:
+            if mt.status != "free" or tpu_name in exclude:
                 continue
-            if tpu_matches_job(mt.tpu, job):
-                return tpu_name
-        # Stolen
-        for tpu_name, mt in tpus.items():
-            if mt.status != "free" or mt.owned or tpu_name in exclude:
+            if not tpu_matches_job(mt.tpu, job):
                 continue
-            if tpu_matches_job(mt.tpu, job):
-                return tpu_name
-        return None
+            mounted_datasets = mt.datasets or []
+            missing_datasets = sum(1 for ds in job.datasets if ds not in mounted_datasets)
+            owned_penalty = 0 if mt.owned else 1
+            score = (missing_datasets, owned_penalty, tpu_name)
+            candidates.append((score, tpu_name))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[0])
+        return candidates[0][1]
 
 
     def summary(self) -> tuple[str, int]:
@@ -660,6 +579,47 @@ class Scheduler:
         if summary_lines:
             summary += "\n" + "\n".join(summary_lines)
         return summary, n_owned_tpus
+
+    def drain_cancelled_jobs(self):
+        _, jobs, _ = self.file_state.snapshot()
+        pending: dict[int, TPU] = {
+            job.job_id: job.assigned_tpu
+            for job in jobs.values()
+            if job.status == "cancelled" and job.assigned_tpu is not None
+        }
+        if len(pending) == 0:
+            return
+
+        kill_targets: dict[str, TPU] = {}
+        for tpu in pending.values():
+            kill_targets[tpu.name] = tpu
+
+        for tpu in kill_targets.values():
+            thread_log(f"Killing processes for cancelled jobs on {tpu.name}...")
+            kill_local_processes(tpu.name)
+            kill_remote_processes(tpu.name, tpu.zone)
+
+        with self.file_state.transact():
+            running_tpus = {
+                j.assigned_tpu.name
+                for j in self.file_state._jobs.values()
+                if j.status == "running" and j.assigned_tpu is not None
+            }
+            for job_id, expected_tpu in pending.items():
+                job = self.file_state._jobs.get(job_id)
+                if job is None or job.status != "cancelled" or job.assigned_tpu is None:
+                    continue
+                if job.assigned_tpu.name != expected_tpu.name:
+                    continue
+                job.assigned_tpu = None
+            for tpu_name, _ in kill_targets.items():
+                mt = self.file_state._tpus.get(tpu_name)
+                if mt is None:
+                    continue
+                if tpu_name in running_tpus:
+                    continue
+                if mt.status == "busy":
+                    mt.status = "free"
 
 
     def steal_tick(self):
@@ -702,8 +662,11 @@ class Scheduler:
             tpu, started_at = self._steal_target
             info = check_vacancy(tpu.name, tpu.zone)
             elapsed = time.time() - started_at
-            if not info["vacant"]:
-                thread_log(f"TPU {tpu.name} became busy ({int(elapsed)}s / {self.steal_wait}s). Aborting steal.")
+            if info is None or not info[0]:
+                if info is None:
+                    thread_log(f"TPU {tpu.name} died. Aborting steal.")
+                else:
+                    thread_log(f"TPU {tpu.name} became busy ({int(elapsed)}s / {self.steal_wait}s). Aborting steal.")
                 self._steal_target = None
                 with self.file_state.transact():
                     job = self.file_state._jobs[job.job_id]
@@ -740,7 +703,7 @@ class Scheduler:
                     thread_log(f"[job {job.job_id}] no longer runnable before launch, skipping launch")
                     return
 
-            returncode, log_dir = launch(
+            returncode = launch(
                 mt.tpu, job.command, stage_dir=job.stage_dir,
                 run_name=job.run_name, project_name=job.project_name,
                 datasets=job.datasets,
@@ -748,16 +711,6 @@ class Scheduler:
             if returncode != 0:  # Job failed to start
                 self.finalize_job(job, returncode)
                 return
-            
-            with fs.transact():
-                tracked_job = fs._jobs[job.job_id]
-                if (
-                    tracked_job.status == "running"
-                    and tracked_job.assigned_tpu is not None
-                    and tracked_job.assigned_tpu.name == mt.tpu.name
-                ):
-                    tracked_job.log_dir = log_dir
-
 
     def finalize_job(self, job: Job, returncode: int):
         fs = self.file_state
@@ -780,10 +733,10 @@ class Scheduler:
                 run_name = tracked_job.run_name
                 project_name = tracked_job.project_name
                 attempt = tracked_job.attempt
-                max_retry = tracked_job.max_retry
+                max_att = tracked_job.max_att
 
             might_retry = (
-                max_retry > attempt
+                max_att > attempt
                 and returncode != 0
                 and returncode != EXIT_CODE_FATAL
             )
@@ -826,7 +779,6 @@ class Scheduler:
                     job.assigned_tpu = None
                     job.priority += 1
                     job.stage_dir = new_stage_dir
-                    job.log_dir = None
                     thread_log(f"[job {job.job_id}] failed and re-queued (exit {returncode})", force_print=True)
                 else:
                     job.status = "failed"
@@ -842,9 +794,6 @@ class Scheduler:
                 continue
             if job.assigned_tpu.num_workers is None:
                 thread_log(f"[job {job.job_id}] ERROR: TPU {job.assigned_tpu.name} has no num_workers.", force_print=True)
-                continue
-            if job.log_dir is None:
-                thread_log(f"[job {job.job_id}] ERROR: Job {job.job_id} has no log_dir.", force_print=True)
                 continue
 
             returncode = poll_launch(job.log_dir, job.launch_token, job.assigned_tpu.num_workers)
@@ -870,7 +819,8 @@ class Scheduler:
             return prev_tick
 
         self.poll_jobs()
-        sync_tracked_tpus(self.file_state)
+        self.drain_cancelled_jobs()
+        sync_state(self.file_state)
 
         tick, num_owned = self.summary()
         if tick != prev_tick:
@@ -941,7 +891,6 @@ class Scheduler:
                 matched_mt.status = "busy"
                 matched_job.status = "running"
                 matched_job.assigned_tpu = matched_mt.tpu
-                matched_job.log_dir = stage_dir_to_log_dir(matched_job.stage_dir)
                 matched_job.attempt += 1
                 to_launch.append((matched_job.job_id, matched_mt.tpu.name))
         

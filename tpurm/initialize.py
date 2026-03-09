@@ -7,8 +7,8 @@ import subprocess
 
 from .common import (
     TPU, AllocMode, ALLOCATION_MODES, REPO_ROOT,
-    _thread_local, thread_log, check_env,
-    wait_for_ssh, gcloud_ssh, gcloud_create_tpu, gcloud_describe_tpu,
+    thread_log, check_env,
+    gcloud_ssh, gcloud_create_tpu, gcloud_describe_tpu,
     run_remote_script,
 )
 from . import wheelhouse
@@ -60,14 +60,36 @@ def allocate(
     thread_log(f"Error: Failed to allocate TPU {tpu.name} after {max_retries} attempts.")
 
 
+
+def wait_for_ssh(tpu_name: str, zone: str, poll_interval: int = 15, max_attempts: int = 20) -> bool:
+    """Poll until SSH works on all workers. Returns True if successful."""
+    for attempt in range(1, max_attempts + 1):
+        result = gcloud_ssh(
+            tpu_name, zone, "true",
+            worker="all", timeout=30,
+            capture_output=True,
+            max_ssh_tries=1,
+        )
+        if result.ok:
+            thread_log(f"SSH ready on {tpu_name} (attempt {attempt})")
+            return True
+        thread_log(f"SSH not ready on {tpu_name} (attempt {attempt}/{max_attempts}), retrying in {poll_interval}s...")
+        time.sleep(poll_interval)
+    thread_log(f"Error: SSH never became ready on {tpu_name}")
+    return False
+
+
 def reboot(tpu: TPU, boot_wait: int = 300) -> bool:
     """Issue 'sudo reboot' on all workers, wait, then poll until SSH works."""
     thread_log(f"Rebooting all workers on {tpu.name}...")
     try:
         result = gcloud_ssh(
             tpu.name, tpu.zone, "sudo reboot",
-            check=False, timeout=20,
+            worker="all",
+            timeout=15,
+            capture_output=False,
             ssh_flags=["-o ConnectionAttempts=1", "-o ConnectTimeout=5"],
+            max_ssh_tries=1,
         )
     except subprocess.TimeoutExpired:
         exists, state, _ = gcloud_describe_tpu(tpu.name, tpu.zone)
@@ -78,19 +100,20 @@ def reboot(tpu: TPU, boot_wait: int = 300) -> bool:
         else:
             thread_log(f"Reboot command timed out for {tpu.name}; skipping reboot wait.")
         return False
-    if not getattr(_thread_local, "dry_run", False):
-        if result is None or result.returncode != 0:
-            exists, state, _ = gcloud_describe_tpu(tpu.name, tpu.zone)
-            if not exists:
-                thread_log(f"Reboot command failed and TPU {tpu.name} no longer exists; skipping reboot wait.")
-            elif _is_terminal_tpu_state(state):
-                thread_log(f"Reboot command failed and TPU {tpu.name} is in terminal state {state}; skipping reboot wait.")
-            else:
-                thread_log(f"Reboot command failed for {tpu.name}; skipping reboot wait.")
-            return False
+    if not result.ok:
+        if result.ssh_retry_exhausted:
+            thread_log(f"Reboot SSH retries exhausted for {tpu.name}; TPU likely preempted.")
+        exists, state, _ = gcloud_describe_tpu(tpu.name, tpu.zone)
+        if not exists:
+            thread_log(f"Reboot command failed and TPU {tpu.name} no longer exists; skipping reboot wait.")
+        elif _is_terminal_tpu_state(state):
+            thread_log(f"Reboot command failed and TPU {tpu.name} is in terminal state {state}; skipping reboot wait.")
+        else:
+            thread_log(f"Reboot command failed for {tpu.name}; skipping reboot wait.")
+        return False
 
-        thread_log(f"Restart issued. Sleeping for {boot_wait} seconds...")
-        time.sleep(boot_wait)
+    thread_log(f"Restart issued. Sleeping for {boot_wait} seconds...")
+    time.sleep(boot_wait)
     return wait_for_ssh(tpu.name, tpu.zone)
 
 
@@ -100,16 +123,13 @@ def init_and_install(
     skip_upgrade: bool = False,
 ) -> bool:
     # Detect number of workers
-    if getattr(_thread_local, "dry_run", False):
-        n_workers = 1
-    else:
-        exists, _, n_workers = gcloud_describe_tpu(tpu.name, tpu.zone)
-        if not exists:
-            thread_log(f"Error: could not describe TPU {tpu.name}.")
-            return False
-        if n_workers is None:
-            thread_log(f"Error: could not parse worker count for TPU {tpu.name}.")
-            return False
+    exists, _, n_workers = gcloud_describe_tpu(tpu.name, tpu.zone)
+    if not exists:
+        thread_log(f"Error: could not describe TPU {tpu.name}.")
+        return False
+    if n_workers is None:
+        thread_log(f"Error: could not parse worker count for TPU {tpu.name}.")
+        return False
     thread_log(f"Detected {n_workers} worker(s)")
     tpu.num_workers = n_workers
 
@@ -125,7 +145,7 @@ def init_and_install(
         
         # init
         init_env = {"SKIP_UPGRADE": "1"} if skip_upgrade else {"SKIP_UPGRADE": "0"}
-        if not run_remote_script(tpu.name, tpu.zone, "init.sh", env=init_env, max_ssh_retries=3):
+        if not run_remote_script(tpu.name, tpu.zone, "init.sh", env=init_env, max_ssh_tries=3):
             thread_log("init.sh failed. Retrying in 15s.")
             time.sleep(15)
             continue
@@ -142,14 +162,13 @@ def init_and_install(
             if not install_success:
                 thread_log("Warning: wheelhouse install failed; falling back to install.sh")
         if not install_success:
-            if not run_remote_script(tpu.name, tpu.zone, "install.sh", env={"REQUIREMENTS_LOCK": requirements_lock}, max_ssh_retries=3):
+            if not run_remote_script(tpu.name, tpu.zone, "install.sh", env={"REQUIREMENTS_LOCK": requirements_lock}, max_ssh_tries=3):
                 thread_log("install.sh failed. Retrying in 30s.")
                 time.sleep(30)
                 continue
 
-        if not getattr(_thread_local, "dry_run", False):
-            thread_log(f"Waiting {settle_time}s for environment to settle...")
-            time.sleep(settle_time)
+        thread_log(f"Waiting {settle_time}s for environment to settle...")
+        time.sleep(settle_time)
         if not check_env(tpu.name, tpu.zone):
             thread_log("Warning: Env check failed. Retrying...")
             continue

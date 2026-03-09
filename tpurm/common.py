@@ -11,7 +11,7 @@ import threading
 import time
 import dotenv
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 from dataclasses import dataclass, field
 from contextlib import contextmanager
 
@@ -39,8 +39,8 @@ NFS_US = "/kmh-nfs-us-mount"
 NFS_SSD_US = "/kmh-nfs-ssd-us-mount"
 DEFAULT_SA_KEY_FILE: str = os.getenv("DEFAULT_SA_KEY_FILE")  # type: ignore
 DEFAULT_KEYS_DIR: str = os.getenv("DEFAULT_KEYS_DIR")  # type: ignore
-SUPPORTED_DATASETS: tuple[str, ...] = ("imagenet", "fineweb")
-
+DatasetName = Literal["imagenet", "fineweb"]
+SUPPORTED_DATASETS = list(get_args(DatasetName))
 
 # TPU configuration
 # To add a new config: add service accounts, bucket, bucket key
@@ -105,6 +105,7 @@ ALLOCATION_MODES: dict[AllocMode, dict[str, str]] = {
 
 _LOG_MAX_BYTES = 5 * 1024 * 1024
 _LOG_ROTATE_CHECK_EVERY = 1000
+
 
 @dataclass
 class TPU:
@@ -235,7 +236,7 @@ def thread_log(msg: str, force_print: bool=False):
 def run_cmd(cmd: list[str], **kwargs) -> subprocess.CompletedProcess | None:
     """
     Run a command in a subprocess, and return the completed process.
-    Handles dry_run and logging redirection.
+    Handles logging redirection.
 
     Common kwargs:
         check: bool = False
@@ -243,9 +244,7 @@ def run_cmd(cmd: list[str], **kwargs) -> subprocess.CompletedProcess | None:
         capture_output: bool = False
     """
     flat = " ".join(cmd)
-    thread_log(f"$ {flat}")
-    if getattr(_thread_local, "dry_run", False):
-        return None
+    thread_log(f"$ {flat[:200]}")
 
     # Redirect subprocess stdout and stderr to log file
     f = getattr(_thread_local, "log_file", None)
@@ -259,36 +258,6 @@ def run_cmd(cmd: list[str], **kwargs) -> subprocess.CompletedProcess | None:
     return subprocess.run(cmd, **kwargs)
 
 
-def run_cmd_ssh_retry(cmd: list[str], max_retries: int) -> subprocess.CompletedProcess | None:
-    """Run a subprocess, kill it after max_retries gcloud SSH retry messages."""
-    flat = " ".join(cmd)
-    thread_log(f"$ {flat}")
-    if getattr(_thread_local, "dry_run", False):
-        return None
-
-    f = getattr(_thread_local, "log_file", None)
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    retry_count = 0
-    try:
-        for line in proc.stdout:  # type: ignore
-            if f:
-                f.write(line)
-                f.flush()
-            if "Retrying:" in line:
-                retry_count += 1
-                if retry_count >= max_retries:
-                    thread_log(f"SSH retried {max_retries} times, killing (TPU likely preempted)")
-                    proc.kill()
-                    proc.wait()
-                    return subprocess.CompletedProcess(cmd, returncode=-1)
-        proc.wait()
-    except Exception:
-        proc.kill()
-        proc.wait()
-        raise
-    return subprocess.CompletedProcess(cmd, returncode=proc.returncode)
-
-
 def ensure_ssh_key():
     key_path = Path.home() / ".ssh" / "google_compute_engine"
     if not key_path.exists():
@@ -299,12 +268,30 @@ def ensure_ssh_key():
             check=True,
         )
 
+SSHStatus = Literal["ok", "error", "ssh_retry_exhausted"]
+
+@dataclass(slots=True)
+class SSHResult:
+    status: SSHStatus
+    returncode: int
+    stdout: str = ""
+    stderr: str = ""
+    @property
+    def ok(self) -> bool:
+        return self.status == "ok"
+    @property
+    def ssh_retry_exhausted(self) -> bool:
+        return self.status == "ssh_retry_exhausted"
+
+
 def gcloud_ssh(
     tpu_name: str, zone: str, command: str, *,
-    worker: str = "all", ssh_flags: list[str] | None = None,
-    check: bool = False, timeout: float | None = None, capture_output: bool = False,
-    max_ssh_retries: int | None = None,
-) -> subprocess.CompletedProcess | None:
+    worker: str,
+    timeout: float|None,
+    capture_output: bool,
+    max_ssh_tries: int,
+    ssh_flags: list[str] | None = None,
+) -> SSHResult:
     """SSH into a TPU VM and run a command on the specified worker(s)."""
     ensure_ssh_key()
     cmd = [
@@ -316,38 +303,77 @@ def gcloud_ssh(
     if ssh_flags:
         for flag in ssh_flags:
             cmd.extend(["--ssh-flag", flag])
-    if max_ssh_retries is not None:
-        return run_cmd_ssh_retry(cmd, max_ssh_retries)
-    return run_cmd(cmd, check=check, timeout=timeout, capture_output=capture_output, text=capture_output)
+    thread_log(f"$ {(" ".join(cmd))[:200]}")
 
+    f = getattr(_thread_local, "log_file", None)
+    captured: list[str] = []
+    retry_count = 0  # Number of "Retrying:" lines seen.
+    retry_exhausted = False
+    started_at = time.monotonic()
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            if capture_output:
+                captured.append(line)
+            elif f is not None:
+                f.write(line)
+                f.flush()
+            else:
+                sys.stdout.write(line)
+                sys.stdout.flush()
 
-def wait_for_ssh(tpu_name: str, zone: str, poll_interval: int = 15, max_attempts: int = 20) -> bool:
-    """Poll until SSH works on all workers. Returns True if successful."""
-    for attempt in range(1, max_attempts + 1):
-        result = gcloud_ssh(
-            tpu_name, zone, "true",
-            worker="all", check=False, timeout=30,
-            capture_output=True,
+            if "Retrying:" in line:
+                retry_count += 1
+                if retry_count >= max_ssh_tries:
+                    thread_log(
+                        f"SSH attempt limit reached ({max_ssh_tries}); TPU likely preempted"
+                    )
+                    proc.kill()
+                    retry_exhausted = True
+                    break
+
+            if timeout is not None and (time.monotonic() - started_at) > timeout:
+                raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout, output="".join(captured))
+
+        proc.wait()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+    stdout = "".join(captured)
+    if retry_exhausted:
+        return SSHResult(
+            status="ssh_retry_exhausted",
+            returncode=-1,
+            stdout=stdout,
         )
-        if getattr(_thread_local, "dry_run", False):
-            return True
-        if result is not None and result.returncode == 0:
-            thread_log(f"SSH ready on {tpu_name} (attempt {attempt})")
-            return True
-        thread_log(f"SSH not ready on {tpu_name} (attempt {attempt}/{max_attempts}), retrying in {poll_interval}s...")
-        time.sleep(poll_interval)
-    thread_log(f"Error: SSH never became ready on {tpu_name}")
-    return False
+
+    returncode = proc.returncode if proc.returncode is not None else 1
+    return SSHResult(
+        status="ok" if returncode == 0 else "error",
+        returncode=returncode,
+        stdout=stdout,
+    )
 
 
 def read_remote_script(name: str) -> str:
     """Read and return the text of a script in scheduler/remote/."""
     return (SCRIPTS_DIR / "remote" / name).read_text()
 
+
+# TODO: fix this?
 def run_remote_script(
     tpu_name: str, zone: str, script_name: str, *,
     env: dict[str, str] | None = None,
-    max_ssh_retries: int | None = None,
+    max_ssh_tries: int = 3,
 ) -> bool:
     """Run a script in scheduler/remote/ on all workers."""
     script = read_remote_script(script_name)
@@ -355,12 +381,29 @@ def run_remote_script(
     if env:
         env_prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items()) + " "
     remote_cmd = f"{env_prefix}bash -s <<'REMOTE_SCRIPT'\n{script}\nREMOTE_SCRIPT"
-    result = gcloud_ssh(tpu_name, zone, remote_cmd, worker="all", max_ssh_retries=max_ssh_retries)
-    if getattr(_thread_local, "dry_run", False):
-        return True
-    return result is not None and result.returncode == 0
+    result = gcloud_ssh(
+        tpu_name, zone, remote_cmd, 
+        worker="all", 
+        timeout=None,
+        capture_output=False,
+        max_ssh_tries=max_ssh_tries
+    )
+    if result.ssh_retry_exhausted:
+        thread_log(f"SSH retries exhausted while running {script_name} on {tpu_name} (TPU likely preempted)")
+    return result.ok
 
 
+def list_tpus(zone: str) -> list[dict]:
+    cmd = [
+        "gcloud", "compute", "tpus", "tpu-vm", "list",
+        f"--zone={zone}", "--format=json",
+    ]
+    result = run_cmd(cmd, capture_output=True, text=True)
+    if result is None or result.returncode != 0:
+        thread_log(f"Warning: gcloud list failed for zone {zone}: {result.stderr.strip() if result else 'returned None'}")
+        return []
+    return json.loads(result.stdout)
+    
 def gcloud_create_tpu(
     tpu_name: str, zone: str, accelerator_type: str, runtime_version: str, *,
     service_account: str = "", mode_flag: str = "",
@@ -404,79 +447,113 @@ def gcloud_describe_tpu(tpu_name: str, zone: str) -> tuple[bool, str | None, int
     endpoints = info.get("networkEndpoints")
     if isinstance(endpoints, list):
         num_workers = max(len(endpoints), 1)
+    thread_log(f"Info: {info}")
     return True, info.get("state"), num_workers
 
 
 # Helpers for monitoring TPU status
+# We make the convention that None means "SSH failed"
 
-def check_env(tpu_name: str, zone: str) -> bool:
+def check_env(tpu_name: str, zone: str, timeout: float = 15, max_ssh_tries: int=3) -> bool | None:
     """Check if the software environment is correctly initialized on all workers."""
     thread_log(f"Checking environment on {tpu_name}...")
-    if getattr(_thread_local, "dry_run", False):
-        return True
-    checks = [
-        ("NFS mounts", "test -d /kmh-nfs-us-mount && test -d /kmh-nfs-ssd-us-mount"),
-        ("JAX/Flax import", "python3.13 -c 'import jax; import flax' 2>/dev/null"),
-    ]
-    for name, cmd in checks:
+    cmd = (
+        'wid="${TPU_WORKER_ID:-$(hostname)}"; '
+        "mounts=1; test -d /kmh-nfs-us-mount && test -d /kmh-nfs-ssd-us-mount || mounts=0; "
+        "jax_flax=1; python3.13 -c 'import jax; import flax' >/dev/null 2>&1 || jax_flax=0; "
+        "ok=$((mounts && jax_flax)); "
+        'echo "__TPURM_ENV__ worker=${wid} mounts=${mounts} jax_flax=${jax_flax} ok=${ok}"; '
+        "exit 0"
+    )
+    try:
         result = gcloud_ssh(
-            tpu_name,
-            zone,
-            cmd,
+            tpu_name, zone, cmd,
             worker="all",
-            check=False,
-            max_ssh_retries=2,
+            timeout=timeout,
+            capture_output=True,
+            max_ssh_tries=max_ssh_tries,
         )
-        if result is None or result.returncode != 0:
-            thread_log(f"Environment check failed: {name}")
-            return False
+    except subprocess.TimeoutExpired:
+        thread_log(f"SSH timed out: {tpu_name}")
+        return
+    if not result.ok:
+        thread_log(f"SSH failed on {tpu_name}: {result}")
+        return
+
+    by_worker: dict[str, tuple[int, int, int]] = {}
+    for line in result.stdout.splitlines():
+        parsed = re.search(
+            r"__TPURM_ENV__ worker=([^ ]+) mounts=([01]) jax_flax=([01]) ok=([01])",
+            line,
+        )
+        if parsed is None:
+            continue
+        worker, mounts, jax_flax, ok = parsed.groups()
+        by_worker[worker] = (int(mounts), int(jax_flax), int(ok))
+
+    if not by_worker:
+        thread_log("Environment check failed: no parseable env markers returned")
+        return False
+
+    failed = [worker for worker, (_, _, ok) in by_worker.items() if ok == 0]
+    if failed:
+        details = ", ".join(
+            f"{worker}(mounts={mounts},jax_flax={jax_flax})"
+            for worker, (mounts, jax_flax, _) in by_worker.items()
+            if worker in failed
+        )
+        thread_log(f"Environment check failed on workers: {details}")
+        return False
+
     thread_log("Environment check: Passed")
     return True
 
 
-def check_datasets_mounts(tpu_name: str, zone: str, datasets: list[str] | None = None) -> dict[str, bool]:
+def check_datasets_mounts(tpu_name: str, zone: str, timeout: float = 15, max_ssh_tries: int=3) -> list[DatasetName] | None:
     """
     Check mount presence for multiple datasets.
     """
-    target_datasets = datasets or list(SUPPORTED_DATASETS)
-    for dataset in target_datasets:
-        if dataset not in SUPPORTED_DATASETS:
-            raise ValueError(f"Unsupported dataset '{dataset}'. Expected one of: {', '.join(SUPPORTED_DATASETS)}")
     script = read_remote_script("warmup.sh")
-    remote_cmd = f"ACTION=check_all bash -s <<'REMOTE_SCRIPT'\n{script}\nREMOTE_SCRIPT"
+    cmd = f"ACTION=check_all bash -s <<'REMOTE_SCRIPT'\n{script}\nREMOTE_SCRIPT"
 
     try:
         result = gcloud_ssh(
-            tpu_name, zone,
-            remote_cmd,
-            worker="0", timeout=30, capture_output=True,
+            tpu_name, zone, cmd,
+            worker="0", 
+            timeout=timeout,
+            capture_output=True,
+            max_ssh_tries=max_ssh_tries,
         )
     except subprocess.TimeoutExpired:
-        thread_log(f"  {tpu_name}: SSH timed out")
-        return {dataset: False for dataset in target_datasets}
+        thread_log(f"SSH timed out: {tpu_name}")
+        return
+    if not result.ok:
+        thread_log(f"SSH failed on {tpu_name}: {result}")
+        return
 
-    if getattr(_thread_local, "dry_run", False):
-        return {dataset: True for dataset in target_datasets}
-
-    if result is None or result.returncode != 0:
-        return {dataset: False for dataset in target_datasets}
-
-    parsed: dict[str, bool] = {dataset: False for dataset in SUPPORTED_DATASETS}
+    mounted_ds: list[DatasetName] = []
     for line in result.stdout.splitlines():
-        if "=" not in line:
+        parsed = re.fullmatch(
+            r"(?:__TPURM_DATASET_STATUS__ )?(imagenet|fineweb)=([01])",
+            line.strip(),
+        )
+        if parsed is None:
             continue
-        dataset, value = line.strip().split("=", 1)
-        if dataset in parsed:
-            parsed[dataset] = (value == "1")
+        dataset, value = parsed.groups()
+        if value != "1":
+            continue
+        if dataset == "imagenet":
+            mounted_ds.append("imagenet")
+        else:
+            mounted_ds.append("fineweb")
 
-    return {dataset: parsed.get(dataset, False) for dataset in target_datasets}
+    return mounted_ds
 
-def check_vacancy(tpu_name: str, zone: str, timeout: float = 30) -> dict:
+def check_vacancy(tpu_name: str, zone: str, timeout: float = 15, max_ssh_tries: int=3) -> tuple[bool, str] | None:
     """
     SSH into worker 0 and check if TPU is in use.
     vacant=None means SSH failed.
     """
-    info: dict[str, Any] = {"name": tpu_name, "vacant": None, "load": ""}
     cmd = (
         "lsof /dev/accel* 2>/dev/null || true; "
         "echo ---MARKER---; "
@@ -487,16 +564,17 @@ def check_vacancy(tpu_name: str, zone: str, timeout: float = 30) -> dict:
     try:
         result = gcloud_ssh(
             tpu_name, zone, cmd,
-            worker="0", check=False, timeout=timeout,
+            worker="0", 
+            timeout=timeout,
             capture_output=True,
+            max_ssh_tries=max_ssh_tries,
         )
     except subprocess.TimeoutExpired:
-        thread_log(f"  {tpu_name}: SSH timed out")
-        return info
-    if result is None or result.returncode != 0:
-        if not getattr(_thread_local, "dry_run", False):
-            thread_log(f"  {tpu_name}: SSH failed")
-        return info
+        thread_log(f"SSH timed out: {tpu_name}")
+        return
+    if not result.ok:
+        thread_log(f"SSH failed on {tpu_name}: {result}")
+        return
 
     parts = result.stdout.split("---MARKER---")
     accel_output = parts[0].strip() if len(parts) > 0 else ""
@@ -506,21 +584,8 @@ def check_vacancy(tpu_name: str, zone: str, timeout: float = 30) -> dict:
     if python_output != "":
         thread_log(f"  {tpu_name}: python_output: {python_output}")
 
-    info["load"] = load_output
     load_1m = float(load_output.split()[0]) if load_output else 999.0
     load_5m = float(load_output.split()[1]) if load_output else 999.0
-    info["vacant"] = (accel_output == "") and (python_output == "") and (load_5m < 2.0 or load_1m < 1.0)
-    return info
+    vacant = (accel_output == "") and (python_output == "") and (load_5m < 2.0 or load_1m < 1.0)
+    return vacant, load_output
 
-def list_tpus(zone: str) -> list[dict]:
-    cmd = [
-        "gcloud", "compute", "tpus", "tpu-vm", "list",
-        f"--zone={zone}", "--format=json",
-    ]
-    result = run_cmd(cmd, capture_output=True, text=True)
-    if getattr(_thread_local, "dry_run", False):
-        return []
-    if result is None or result.returncode != 0:
-        thread_log(f"Warning: gcloud list failed for zone {zone}: {result.stderr.strip() if result else 'returned None'}")
-        return []
-    return json.loads(result.stdout)

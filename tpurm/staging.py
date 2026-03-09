@@ -11,7 +11,7 @@ import sys
 import textwrap
 import time
 
-from .common import TPU, REPO_ROOT, NFS_SSD_US, thread_log, run_cmd, gcloud_ssh
+from .common import TPU, DatasetName, REPO_ROOT, NFS_SSD_US, thread_log, run_cmd, gcloud_ssh
 
 dotenv.load_dotenv(Path.home() / ".env")
 WANDB_KEY = os.getenv("WANDB_KEY")
@@ -86,31 +86,23 @@ def kill_remote_processes(tpu_name: str, zone: str):
         "  sleep 3\n"
         "done\n"
     )
-    gcloud_ssh(tpu_name, zone, cmd)
+    result = gcloud_ssh(tpu_name, zone, cmd, worker="all", timeout=None, capture_output=False, max_ssh_tries=2)
+    if not result.ok:
+        if result.ssh_retry_exhausted:
+            thread_log(f"Failed to kill remote processes on {tpu_name}: SSH retries exhausted (TPU likely preempted)")
+        else:
+            thread_log(f"Failed to kill remote processes on {tpu_name}: exit code {result.returncode}")
 
 
-def _dataset_warmup_block(tpu: TPU, datasets: list[str] | None) -> str:
-    ordered: list[str] = []
-    seen: set[str] = set()
-
-    raw = datasets or []
-    for dataset in ("imagenet", "fineweb"):
-        if dataset in raw:
-            ordered.append(dataset)
-            seen.add(dataset)
-    for dataset in raw:
-        if dataset in seen:
-            continue
-        raise ValueError(f"Unsupported dataset '{dataset}'. Expected one of: {', '.join(ALL_DATASETS)}")
-
-    if not ordered:
+def _dataset_warmup_block(tpu: TPU, datasets: list[DatasetName] | None) -> str:
+    if not datasets:
         return "echo '[worker] no dataset warmup requested'"
 
     lines = [
         'WARMUP_SCRIPT="tpurm/remote/warmup.sh"',
         'if [ ! -f "$WARMUP_SCRIPT" ]; then echo "[worker] ERROR: missing $WARMUP_SCRIPT" >&2; exit 10; fi',
     ]
-    for dataset in ordered:
+    for dataset in datasets:
         gcs_subpath = "data/imagenet" if dataset == "imagenet" else "data/fineweb"
         gcs_prefix = f"{tpu.bucket}/{gcs_subpath}"
         clean_dest = "false" if dataset == "imagenet" else "true"
@@ -134,14 +126,18 @@ def _dataset_warmup_block(tpu: TPU, datasets: list[str] | None) -> str:
     return "\n".join(lines)
 
 
+def stage_dir_to_log_dir(stage_dir: str) -> str:
+    stage_dir_suffix = stage_dir.split("/staging/")[-1]
+    return f"{NFS_SSD_US}/logs/{stage_dir_suffix}"
+    
 def launch(
     tpu: TPU,
     command: str,
     run_name: str,
     project_name: str,
     stage_dir: str,
-    datasets: list[str] | None = None,
-) -> tuple[int, str]:
+    datasets: list[DatasetName] | None = None,
+) -> int:
     """
     Dispatch a command on all TPU VM workers and return immediately.
 
@@ -149,8 +145,8 @@ def launch(
     which will be replaced with the corresponding arguments.
     """
     stage_dir_suffix = stage_dir.split("/staging/")[-1]
-    launch_token = stage_dir_suffix.split("/")[-1].split("__")[-2]
-    log_dir = f"{NFS_SSD_US}/logs/{stage_dir_suffix}"
+    launch_token = stage_dir.split("/")[-1].split("__")[-2]
+    log_dir = stage_dir_to_log_dir(stage_dir)
     os.makedirs(log_dir, exist_ok=True)
     os.chmod(log_dir, 0o777)
 
@@ -235,15 +231,24 @@ def launch(
     thread_log(f"Using service account: {tpu.service_account}")
     thread_log(f"Running at {tpu.name} {tpu.zone}")
     thread_log(f"Experiment logs at: {log_dir}", force_print=True)
-    result = gcloud_ssh(tpu.name, tpu.zone, remote_cmd, worker="all", max_ssh_retries=3)
+    result = gcloud_ssh(
+        tpu.name, tpu.zone, remote_cmd, 
+        worker="all", 
+        timeout=None, 
+        capture_output=False, 
+        max_ssh_tries=3
+    )
 
     # This is the return code of the gcloud call, not the remote command
-    returncode = result.returncode if result is not None else EXIT_CODE_SSH_RETRY
+    if result.ssh_retry_exhausted:
+        returncode = EXIT_CODE_SSH_RETRY
+    else:
+        returncode = result.returncode
     if returncode == EXIT_CODE_SSH_RETRY:
         thread_log(f"Failed to launch job: exit code {returncode} (SSH retries exceeded).")
     elif returncode != 0:
         thread_log(f"Failed to launch job: exit code {returncode}.")
-    return returncode, log_dir
+    return returncode
 
 
 def poll_launch(log_dir: str, launch_token: str, expected_workers: int) -> int | None:
