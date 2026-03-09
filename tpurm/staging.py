@@ -101,7 +101,10 @@ def kill_remote_processes(tpu_name: str, zone: str):
         "sudo pkill -15 python || true\n"
         "sleep 2\n"
         "sudo pkill -9 python || true\n"
-        "sudo pkill -9 -f 'tpurm_warmup_occupy.py|warmup.sh|gcloud storage|zstd|pv|tar -C' || true\n"
+        # Avoid broad `pkill -f` patterns here: they can match this cleanup shell itself.
+        "sudo pkill -9 zstd || true\n"
+        "sudo pkill -9 pv || true\n"
+        "sudo pkill -9 tar || true\n"
         "sudo fuser -k 8476/tcp >/dev/null 2>&1 || true\n"
         "sudo fuser -k /dev/vfio/0 >/dev/null 2>&1 || true\n"
         "sudo rm -rf /tmp/libtpu_lockfile /tmp/tpu_logs /tmp/*tpu* || true\n"
@@ -116,7 +119,7 @@ def kill_remote_processes(tpu_name: str, zone: str):
         zone,
         cmd,
         worker="all",
-        timeout=20,
+        timeout=60,
         capture_output=False,
         max_ssh_tries=2,
     )
