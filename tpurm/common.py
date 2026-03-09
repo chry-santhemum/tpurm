@@ -322,7 +322,8 @@ def gcloud_ssh(
             cmd.extend(["--ssh-flag", flag])
     thread_log(f"$ {repr(' '.join(cmd))[:200]}")
 
-    f = getattr(_thread_local, "log_file", None)
+    ssh_log_path = REPO_ROOT / ".tpurm" / "logs" / "gcloud_ssh.log"
+    ssh_log_path.parent.mkdir(parents=True, exist_ok=True)
     captured: list[str] = []
     retry_count = 0  # Number of "Retrying:" lines seen.
     retry_exhausted = False
@@ -337,33 +338,25 @@ def gcloud_ssh(
 
     try:
         assert proc.stdout is not None
-        for line in proc.stdout:
-            if capture_output:
-                captured.append(line)
-                if f is not None:
-                    f.write(line)
-                    f.flush()
-                    _bump_log_rotation_check(f)
-            elif f is not None:
-                f.write(line)
-                f.flush()
-                _bump_log_rotation_check(f)
-            else:
-                sys.stdout.write(line)
-                sys.stdout.flush()
+        with open(ssh_log_path, "a") as ssh_log:
+            for line in proc.stdout:
+                if capture_output:
+                    captured.append(line)
+                ssh_log.write(line)
+                ssh_log.flush()
+                _bump_log_rotation_check(ssh_log)
 
-            if "Retrying:" in line:
-                retry_count += 1
-                if retry_count >= max_ssh_tries:
-                    thread_log(
-                        f"SSH attempt limit reached ({max_ssh_tries}); TPU likely preempted"
-                    )
-                    proc.kill()
-                    retry_exhausted = True
-                    break
-            if timeout is not None and (time.monotonic() - started_at) > timeout:
-                raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout, output="".join(captured))
-
+                if "Retrying:" in line:
+                    retry_count += 1
+                    if retry_count >= max_ssh_tries:
+                        thread_log(
+                            f"SSH attempt limit reached ({max_ssh_tries}); TPU likely preempted"
+                        )
+                        proc.kill()
+                        retry_exhausted = True
+                        break
+                if timeout is not None and (time.monotonic() - started_at) > timeout:
+                    raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout, output="".join(captured))
         proc.wait()
     finally:
         if proc.poll() is None:
