@@ -5,7 +5,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from .common import (
     TPU_CONFIGS,
     thread_log, zone_to_region, name_to_tpu,
-    check_vacancy, list_tpus, set_thread_vars, _thread_local
+    check_vacancy, list_tpus, set_thread_vars, _thread_local,
+    gcloud_describe_tpu,
 )
 
 
@@ -65,6 +66,12 @@ def scan_target(tpu_sizes: list[str], regions: list[str]) -> list[tuple[str, str
 
     def _check(name, zone):
         with set_thread_vars(log_file=log_file):
+            exists, state, health, _ = gcloud_describe_tpu(name, zone)
+            if (not exists) or state != "READY" or (health is not None and health != "HEALTHY"):
+                thread_log(
+                    f"[steal.py] Skipping {name}: state={state}, health={health}"
+                )
+                return False, f"{state or 'UNKNOWN'}/{health or 'UNKNOWN'}"
             return check_vacancy(name, zone)
 
     results = {}
