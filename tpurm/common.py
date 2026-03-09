@@ -191,22 +191,35 @@ def set_thread_vars(**kwargs):
 
 def _maybe_rotate_log(f):
     try:
-        pos = f.tell()
-        if pos < _LOG_MAX_BYTES:
+        log_path = getattr(f, "name", None)
+        if not isinstance(log_path, str):
             return
-        f.seek(0)
-        data = f.read()
-        keep = data[len(data) // 2:]
-        # Find first newline to avoid partial line
-        nl = keep.find("\n")
-        if nl != -1:
-            keep = keep[nl + 1:]
-        f.seek(0)
-        f.write(keep)
-        f.truncate()
         f.flush()
+        while Path(log_path).stat().st_size >= _LOG_MAX_BYTES:
+            with open(log_path, "r+") as rf:
+                data = rf.read()
+                if not data:
+                    break
+                keep = data[len(data) // 2:]
+                # Find first newline to avoid partial line
+                nl = keep.find("\n")
+                if nl != -1:
+                    keep = keep[nl + 1:]
+                rf.seek(0)
+                rf.write(keep)
+                rf.truncate()
+                rf.flush()
+
+        # Keep append-mode handles writing from EOF after rotation.
+        f.seek(0, os.SEEK_END)
     except Exception:
         pass
+
+
+def _bump_log_rotation_check(f):
+    _thread_local.log_write_count = getattr(_thread_local, "log_write_count", 0) + 1
+    if _thread_local.log_write_count % _LOG_ROTATE_CHECK_EVERY == 0:
+        _maybe_rotate_log(f)
 
 
 def thread_log(msg: str, force_print: bool=False):
@@ -221,9 +234,7 @@ def thread_log(msg: str, force_print: bool=False):
     if f is not None:
         f.write(line + "\n")
         f.flush()
-        _thread_local.log_write_count = getattr(_thread_local, 'log_write_count', 0) + 1
-        if _thread_local.log_write_count % _LOG_ROTATE_CHECK_EVERY == 0:
-            _maybe_rotate_log(f)
+        _bump_log_rotation_check(f)
         if force_print:
             print(line, flush=True)
     else:
@@ -244,18 +255,24 @@ def run_cmd(cmd: list[str], **kwargs) -> subprocess.CompletedProcess | None:
         capture_output: bool = False
     """
     flat = " ".join(cmd)
-    thread_log(f"$ {flat[:200]}")
+    thread_log(f"$ {repr(flat)[:200]}")
 
     # Redirect subprocess stdout and stderr to log file
     f = getattr(_thread_local, "log_file", None)
+    redirected_to_log = False
     if f is not None and not kwargs.get("capture_output"):
         kwargs["text"] = True
         if "stdout" not in kwargs:
             kwargs["stdout"] = f
+            redirected_to_log = True
         if "stderr" not in kwargs:
             kwargs["stderr"] = f
-        
-    return subprocess.run(cmd, **kwargs)
+            redirected_to_log = True
+
+    result = subprocess.run(cmd, **kwargs)
+    if redirected_to_log:
+        _maybe_rotate_log(f)
+    return result
 
 
 def ensure_ssh_key():
@@ -303,13 +320,13 @@ def gcloud_ssh(
     if ssh_flags:
         for flag in ssh_flags:
             cmd.extend(["--ssh-flag", flag])
-    thread_log(f"$ {(" ".join(cmd))[:200]}")
+    thread_log(f"$ {repr(' '.join(cmd))[:200]}")
 
     f = getattr(_thread_local, "log_file", None)
     captured: list[str] = []
     retry_count = 0  # Number of "Retrying:" lines seen.
     retry_exhausted = False
-    started_at = time.monotonic()
+    timed_out = False
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -317,14 +334,30 @@ def gcloud_ssh(
         text=True,
         bufsize=1,
     )
+    timeout_timer: threading.Timer | None = None
+    if timeout is not None:
+        def _timeout_kill():
+            nonlocal timed_out
+            if proc.poll() is None:
+                timed_out = True
+                proc.kill()
+        timeout_timer = threading.Timer(timeout, _timeout_kill)
+        timeout_timer.daemon = True
+        timeout_timer.start()
+
     try:
         assert proc.stdout is not None
         for line in proc.stdout:
             if capture_output:
                 captured.append(line)
+                if f is not None:
+                    f.write(line)
+                    f.flush()
+                    _bump_log_rotation_check(f)
             elif f is not None:
                 f.write(line)
                 f.flush()
+                _bump_log_rotation_check(f)
             else:
                 sys.stdout.write(line)
                 sys.stdout.flush()
@@ -339,16 +372,17 @@ def gcloud_ssh(
                     retry_exhausted = True
                     break
 
-            if timeout is not None and (time.monotonic() - started_at) > timeout:
-                raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout, output="".join(captured))
-
         proc.wait()
     finally:
+        if timeout_timer is not None:
+            timeout_timer.cancel()
         if proc.poll() is None:
             proc.kill()
             proc.wait()
 
     stdout = "".join(captured)
+    if timed_out:
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout, output=stdout)
     if retry_exhausted:
         return SSHResult(
             status="ssh_retry_exhausted",
@@ -582,10 +616,10 @@ def check_vacancy(tpu_name: str, zone: str, timeout: float = 15, max_ssh_tries: 
     load_output = parts[2].strip() if len(parts) > 2 else ""
 
     if python_output != "":
-        thread_log(f"  {tpu_name}: python_output: {python_output}")
+        python_examples = "\n".join(python_output.split("\n")[:4])
+        thread_log(f"  {tpu_name}: python process examples:\n{python_examples}")
 
     load_1m = float(load_output.split()[0]) if load_output else 999.0
     load_5m = float(load_output.split()[1]) if load_output else 999.0
     vacant = (accel_output == "") and (python_output == "") and (load_5m < 2.0 or load_1m < 1.0)
     return vacant, load_output
-

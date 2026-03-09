@@ -28,7 +28,7 @@ from typing import Optional, Any, Literal
 
 from .common import (
     TPU, DatasetName,
-    REPO_ROOT, TPU_CONFIGS, NFS_SSD_US, SUPPORTED_DATASETS,
+    REPO_ROOT, TPU_CONFIGS,
     _thread_local, thread_log, set_thread_vars,
     zone_to_region, name_to_tpu, size_to_family,
     gcloud_delete_tpu, gcloud_describe_tpu, list_tpus,
@@ -40,6 +40,7 @@ from .staging import (
 )
 from .steal import scan_target
 from .initialize import allocate, ensure_ready, reboot
+from .freeze import freeze
 
 FILE_STATE_DIR = str(REPO_ROOT / ".tpurm")
 # I think this might be too complicated
@@ -285,7 +286,7 @@ def submit_job(
     tpu_size: list[str], region: list[str]|None,
     run_name: str, project_name: str,
     command: Optional[str], command_path: Optional[str],
-    datasets: list[str] | None = None,
+    datasets: list[DatasetName],
     priority: int = 0, max_att: int = 0,
     state_dir: Path = Path(FILE_STATE_DIR),
 ) -> int:
@@ -294,15 +295,7 @@ def submit_job(
         command = Path(command_path).read_text().strip()  # type: ignore
     if command.startswith("python "):
         raise ValueError("Use python3.13 instead of python.")
-    requested_datasets = datasets if datasets is not None else ["imagenet"]
-    normalized_datasets: list[DatasetName] = []
-    for dataset in requested_datasets:
-        if dataset == "imagenet":
-            normalized_datasets.append("imagenet")
-        elif dataset == "fineweb":
-            normalized_datasets.append("fineweb")
-        else:
-            raise ValueError(f"Unsupported dataset '{dataset}'. Expected one of: {', '.join(SUPPORTED_DATASETS)}")
+    freeze()
     stage_dir = stage_code(run_name, project_name)
 
     fs = FileState(state_dir)
@@ -323,7 +316,7 @@ def submit_job(
             assigned_tpu=None,
             attempt=0,
             priority=priority,
-            datasets=normalized_datasets,
+            datasets=datasets,
         )
     thread_log(f"Submitted job {job_id}: run_name={run_name}")
     return job_id
@@ -742,6 +735,7 @@ class Scheduler:
             )
             new_stage_dir = None
             if might_retry:
+                freeze()
                 new_stage_dir = stage_code(run_name, project_name)
 
             tpu_dead = False
@@ -828,10 +822,10 @@ class Scheduler:
 
         if num_owned >= self.alloc_max:
             self._alloc_sleep_event.set()
-            thread_log(f"{num_owned}/{self.alloc_max} owned TPUs alive, alloc workers sleep")
+            thread_log(f"{num_owned} owned TPUs, alloc workers sleep")
         else:
             self._alloc_sleep_event.clear()
-            thread_log(f"{num_owned}/{self.alloc_max} owned TPUs alive, alloc workers active")
+            thread_log(f"{num_owned} owned TPUs, alloc workers active")
         
         # Job matching
         matched_pairs: list[tuple[int, str]] = []  # (job_id, tpu_name)
