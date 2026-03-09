@@ -224,15 +224,18 @@ def sync_state(file_state: FileState, startup: bool=False):
     def sync_one(key: tuple[str, str]):
         tpu_name, zone = key
         out = updates[key]
+        exists, state, health, num_workers = gcloud_describe_tpu(tpu_name, zone)
+        if num_workers is not None:
+            out["num_workers"] = num_workers
+        if not exists:
+            out["status"] = "untrack"
+            return
         if (key in check_all) or (read_status[key] in ["need_init", "initializing"]):
-            exists, _, num_workers = gcloud_describe_tpu(tpu_name, zone)
-            if num_workers is not None:
-                out["num_workers"] = num_workers
-            if not exists:
-                out["status"] = "untrack"
-            else:
-                out["status"] = read_status.get(key, None)  # will be filled later
+            out["status"] = read_status.get(key, None)  # will be filled later
         if (key in check_all) or (read_status[key] not in ["need_init", "initializing"]):
+            if state != "READY" or (health is not None and health != "HEALTHY"):
+                out["status"] = "busy"
+                return
             out["datasets"] = check_datasets_mounts(tpu_name, zone, max_ssh_tries=1)
             vacant_ok = check_vacancy(tpu_name, zone, max_ssh_tries=1)
             if vacant_ok is None:
@@ -740,8 +743,8 @@ class Scheduler:
 
             tpu_dead = False
             if returncode == EXIT_CODE_SSH_RETRY:
-                exists, state, _ = gcloud_describe_tpu(tpu.name, tpu.zone)
-                if not exists or state != "READY":
+                exists, state, health, _ = gcloud_describe_tpu(tpu.name, tpu.zone)
+                if (not exists) or state != "READY" or (health is not None and health != "HEALTHY"):
                     thread_log(f"[job {job.job_id}] TPU {tpu.name} failed mid-task, removing it.", force_print=True)
                     tpu_dead = True
 
@@ -792,8 +795,8 @@ class Scheduler:
 
             returncode = poll_launch(job.log_dir, job.launch_token, job.assigned_tpu.num_workers)
             if returncode is None and job.status == "running":
-                exists, state, _ = gcloud_describe_tpu(job.assigned_tpu.name, job.assigned_tpu.zone)
-                if not exists or state != "READY":
+                exists, state, health, _ = gcloud_describe_tpu(job.assigned_tpu.name, job.assigned_tpu.zone)
+                if (not exists) or state != "READY" or (health is not None and health != "HEALTHY"):
                     returncode = EXIT_CODE_SSH_RETRY
             if returncode is None:
                 continue

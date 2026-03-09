@@ -326,7 +326,7 @@ def gcloud_ssh(
     captured: list[str] = []
     retry_count = 0  # Number of "Retrying:" lines seen.
     retry_exhausted = False
-    timed_out = False
+    started_at = time.monotonic()
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -334,16 +334,6 @@ def gcloud_ssh(
         text=True,
         bufsize=1,
     )
-    timeout_timer: threading.Timer | None = None
-    if timeout is not None:
-        def _timeout_kill():
-            nonlocal timed_out
-            if proc.poll() is None:
-                timed_out = True
-                proc.kill()
-        timeout_timer = threading.Timer(timeout, _timeout_kill)
-        timeout_timer.daemon = True
-        timeout_timer.start()
 
     try:
         assert proc.stdout is not None
@@ -371,18 +361,16 @@ def gcloud_ssh(
                     proc.kill()
                     retry_exhausted = True
                     break
+            if timeout is not None and (time.monotonic() - started_at) > timeout:
+                raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout, output="".join(captured))
 
         proc.wait()
     finally:
-        if timeout_timer is not None:
-            timeout_timer.cancel()
         if proc.poll() is None:
             proc.kill()
             proc.wait()
 
     stdout = "".join(captured)
-    if timed_out:
-        raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout, output=stdout)
     if retry_exhausted:
         return SSHResult(
             status="ssh_retry_exhausted",
@@ -463,26 +451,26 @@ def gcloud_delete_tpu(tpu_name: str, zone: str) -> subprocess.CompletedProcess |
     ]
     return run_cmd(cmd)
 
-def gcloud_describe_tpu(tpu_name: str, zone: str) -> tuple[bool, str | None, int | None]:
-    """Return (exists, state, num_workers) for TPU describe."""
+def gcloud_describe_tpu(tpu_name: str, zone: str) -> tuple[bool, str | None, str | None, int | None]:
+    """Return (exists, state, health, num_workers) for TPU describe."""
     cmd = [
         "gcloud", "compute", "tpus", "tpu-vm", "describe",
         tpu_name, "--zone", zone, "--format=json",
     ]
     result = run_cmd(cmd, capture_output=True)
     if result is None or result.returncode != 0:
-        return False, None, None
+        return False, None, None, None
     try:
         info = json.loads(result.stdout)
     except (TypeError, json.JSONDecodeError):
-        return True, None, None
+        return True, None, None, None
 
     num_workers = None
     endpoints = info.get("networkEndpoints")
     if isinstance(endpoints, list):
         num_workers = max(len(endpoints), 1)
     thread_log(f"Info: {info}")
-    return True, info.get("state"), num_workers
+    return True, info.get("state"), info.get("health"), num_workers
 
 
 # Helpers for monitoring TPU status

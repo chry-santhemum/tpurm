@@ -92,7 +92,7 @@ def reboot(tpu: TPU, boot_wait: int = 300) -> bool:
             max_ssh_tries=1,
         )
     except subprocess.TimeoutExpired:
-        exists, state, _ = gcloud_describe_tpu(tpu.name, tpu.zone)
+        exists, state, _, _ = gcloud_describe_tpu(tpu.name, tpu.zone)
         if not exists:
             thread_log(f"Reboot command timed out and TPU {tpu.name} no longer exists; skipping reboot wait.")
         elif _is_terminal_tpu_state(state):
@@ -103,7 +103,7 @@ def reboot(tpu: TPU, boot_wait: int = 300) -> bool:
     if not result.ok:
         if result.ssh_retry_exhausted:
             thread_log(f"Reboot SSH retries exhausted for {tpu.name}; TPU likely preempted.")
-        exists, state, _ = gcloud_describe_tpu(tpu.name, tpu.zone)
+        exists, state, _, _ = gcloud_describe_tpu(tpu.name, tpu.zone)
         if not exists:
             thread_log(f"Reboot command failed and TPU {tpu.name} no longer exists; skipping reboot wait.")
         elif _is_terminal_tpu_state(state):
@@ -123,7 +123,7 @@ def init_and_install(
     skip_upgrade: bool = False,
 ) -> bool:
     # Detect number of workers
-    exists, _, n_workers = gcloud_describe_tpu(tpu.name, tpu.zone)
+    exists, _, _, n_workers = gcloud_describe_tpu(tpu.name, tpu.zone)
     if not exists:
         thread_log(f"Error: could not describe TPU {tpu.name}.")
         return False
@@ -134,7 +134,7 @@ def init_and_install(
     tpu.num_workers = n_workers
 
     for attempt in range(1, max_retries + 1):
-        exists, state, _ = gcloud_describe_tpu(tpu.name, tpu.zone)
+        exists, state, _, _ = gcloud_describe_tpu(tpu.name, tpu.zone)
         if not exists:
             thread_log(f"TPU {tpu.name} no longer exists. Aborting initialization.")
             return False
@@ -194,7 +194,7 @@ def ensure_ready(tpu: TPU, skip_upgrade: bool = False) -> bool:
 
     # Populate num_workers here
     if tpu.num_workers is None:
-        exists, _, n_workers = gcloud_describe_tpu(tpu.name, tpu.zone)
+        exists, _, _, n_workers = gcloud_describe_tpu(tpu.name, tpu.zone)
         if not exists or n_workers is None:
             thread_log(f"Could not determine num_workers for ready TPU {tpu.name}")
             return False

@@ -24,9 +24,9 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_argument("--project-name", required=True)
     sub.add_argument("--command", default=None)
     sub.add_argument("--command-path", default=None)
-    sub.add_argument("--dataset", nargs="+", choices=SUPPORTED_DATASETS, default=["imagenet"])
+    sub.add_argument("--dataset", nargs="+", choices=SUPPORTED_DATASETS, required=True)
     sub.add_argument("--priority", type=int, default=0, help="Priority of the job")
-    sub.add_argument("--max-retry", type=int, default=0, help="Max number of attempts (including first run)")
+    sub.add_argument("--max-att", type=int, default=0, help="Max number of attempts (including first run)")
 
     # cancel
     sub = subparsers.add_parser("cancel", help="Cancel a job")
