@@ -4,163 +4,40 @@
 # TODO: Feature list
 # Build tests that are actually based on simulating the finite state machine
 # If there are jobs queued, allocator should try to allocate according to the jobs queued, not randomly
-# Match jobs down the list as well, not eagerly
 # Call freeze when staging code / when to install dependencies
 # Make common TPU ssh commands simple CLI, e.g. "tpu ssh --name ... --command ..."
 # Delete Bucket folder after failure
 # Relax restart constraint when job failed and no checkpoints saved
 # Make allocator/schedule hparams part of the file state, hence modifiable mid-run
 
-import contextlib
+
 import copy
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import fcntl
-import json
 import os
 import re
 import signal
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, asdict, field
 from pathlib import Path
-from typing import Optional, Any, Literal
+from typing import Optional, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .common import (
-    TPU, DatasetName,
-    REPO_ROOT, TPU_CONFIGS,
+    TPU, DatasetName, TPU_CONFIGS,
     _thread_local, thread_log, set_thread_vars,
     zone_to_region, name_to_tpu, size_to_family,
     gcloud_delete_tpu, gcloud_describe_tpu, list_tpus,
     check_datasets_mounts, check_env, check_vacancy,
 )
+from .state import FILE_STATE_DIR, FileState, Job, ManagedTPU
 from .staging import (
-    stage_code, launch, poll_launch, stage_dir_to_log_dir, has_fatal_error_in_logs,
+    stage_code, launch, poll_launch, has_fatal_error_in_logs,
     kill_remote_processes, EXIT_CODE_FATAL, EXIT_CODE_SSH_RETRY,
 )
 from .steal import scan_target
-from .initialize import allocate, ensure_ready, reboot
+from .initialize import allocate, ensure_ready
 from .freeze import freeze
 
-FILE_STATE_DIR = str(REPO_ROOT / ".tpurm")
-# I think this might be too complicated
-JobStatus = Literal["queued", "matched", "running", "succeeded", "failed", "cancelled", "orphaned"]
-
-
-@dataclass
-class ManagedTPU:
-    tpu: TPU
-    owned: bool
-    status: str   # need_init | initializing | free | busy
-    datasets: list[DatasetName] = field(default_factory=list)
-
-@dataclass
-class Job:
-    # Immutable properties, known at creation time
-    job_id: int
-    created_at: float
-    command: str
-    tpu_size: list[str]
-    region: list[str] | None
-    datasets: list[DatasetName]
-    run_name: str
-    project_name: str
-    max_att: int
-    priority: int  # higher is more prioritized
-    # Mutable properties, updated for each launch
-    stage_dir: str
-    assigned_tpu: TPU | None  # last assigned
-    attempt: int
-    # State
-    status: JobStatus
-
-    @property
-    def launch_token(self) -> str:
-        return self.stage_dir.split("/")[-1].split("__")[-2]
-    @property
-    def log_dir(self) -> str:
-        return stage_dir_to_log_dir(self.stage_dir)
-
-
-def _deserialize(d: Any):
-    # convenience for loading file state
-    if isinstance(d, dict) and all(k in d for k in ["size", "mode", "owner", "id", "zone"]):
-        tpu = TPU(d["size"], d["mode"], d["owner"], d["id"], d["zone"])
-        if d.get("name") and d["name"] != tpu.name:
-            tpu.name = d["name"]
-        if "num_workers" in d:
-            tpu.num_workers = d["num_workers"]
-        return tpu
-    else:
-        return d
-
-class FileState:
-    """
-    File-based state for communication.
-
-    Rules:
-    - submit() will only ADD new jobs in "queued" state.
-    - cancel() will only change the state of jobs to "cancelled" state.
-    - alloc workers will only ADD new ManagedTPUs with "need_init" status.
-    - init workers will only change:
-        - "need_init" to "initializing"
-        - "initializing" to "free" if successful
-        - Removing "initializing" TPUs
-    """
-    _next_job_id: int
-    _jobs: dict[int, Job]  # job_id -> Job
-    _tpus: dict[str, ManagedTPU]  # tpu_name -> ManagedTPU
-
-    def __init__(self, state_dir: Path):
-        self.state_dir = state_dir
-        state_dir.mkdir(parents=True, exist_ok=True)
-
-        self._file_path = state_dir / "state.json"
-        self._lock_path = state_dir / "state.lock"
-        self._mutex = threading.RLock()
-    
-    # Public, thread-safe methods
-    def snapshot(self) -> tuple[int, dict[int, Job], dict[str, ManagedTPU]]:
-        """Return a deepcopy of the file content."""
-        with self._mutex, open(self._lock_path, "w") as lf:
-            fcntl.flock(lf, fcntl.LOCK_SH)
-            self._load_unlocked()
-            return (self._next_job_id, copy.deepcopy(self._jobs), copy.deepcopy(self._tpus))
-
-    @contextlib.contextmanager
-    def transact(self):
-        """Read and write."""
-        with self._mutex, open(self._lock_path, "w") as lf:
-            fcntl.flock(lf, fcntl.LOCK_EX)
-            self._load_unlocked()
-            yield self
-            self._save_unlocked()
-
-    # These methods are NOT thread-safe
-    def _load_unlocked(self):
-        if not self._file_path.exists():
-            self._next_job_id = 1
-            self._jobs = {}
-            self._tpus = {}
-            return
-        with open(self._file_path) as f:
-            data = json.load(f)
-        self._next_job_id = data["next_job_id"]
-        self._jobs = {int(jid): Job(**{k: _deserialize(v) for k, v in job.items()}) for jid, job in data["jobs"].items()}
-        self._tpus = {tpu_name: ManagedTPU(**{k: _deserialize(v) for k, v in tpu.items()}) for tpu_name, tpu in data["tpus"].items()}
-
-    def _save_unlocked(self):
-        data = {
-            "next_job_id": self._next_job_id,
-            "jobs": {str(jid): asdict(job) for jid, job in self._jobs.items()},
-            "tpus": {tpu_name: asdict(tpu) for tpu_name, tpu in self._tpus.items()},
-        }
-        tmp = str(self._file_path) + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, self._file_path)
 
 
 def tpu_matches_job(tpu: TPU, job: Job) -> bool:
@@ -176,6 +53,46 @@ def tpu_matches_job(tpu: TPU, job: Job) -> bool:
         if tpu_family == req_family and tpu_chips >= req_chips and tpu_chips <= 2*req_chips:
             return True
     return False
+
+
+def match_job(job: Job, tpus: dict[str, ManagedTPU], exclude: set[str] | None = None) -> str | None:
+    """
+    Job matching logic.
+    
+    Currently, we greedily find the next ManagedTPU with status free,
+    sorted by ownership and then by the number of missing datasets.
+    TODO: Find the overall best matching, instead of greedily.
+    """
+    if exclude is None:
+        exclude = set()
+    candidates: list[tuple[int, int, str]] = []
+    for tpu_name, mt in tpus.items():
+        if (
+            mt.status != "free"
+            or tpu_name in exclude
+            or not tpu_matches_job(mt.tpu, job)
+        ):
+            continue
+
+        # Count number of datasets missing
+        missing_datasets = sum(1 for ds in job.datasets if ds not in mt.datasets)
+
+        candidates.append((int(mt.owned), -missing_datasets, tpu_name))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][2]
+
+
+def count_stolen_jobs(jobs: dict[int, Job], tpus: dict[str, ManagedTPU]) -> int:
+    """Count the number of jobs matched to or running on stolen TPUs."""
+    stolen_names = {tpu_name for tpu_name, mt in tpus.items() if not mt.owned}
+    return sum(
+        1 for j in jobs.values()
+        if j.status in ("matched", "running")
+        and j.assigned_tpu is not None
+        and j.assigned_tpu.name in stolen_names
+    )
 
 
 def sync_state(file_state: FileState, startup: bool=False):
@@ -238,14 +155,16 @@ def sync_state(file_state: FileState, startup: bool=False):
                 return
             out["datasets"] = check_datasets_mounts(tpu_name, zone, max_ssh_tries=1)
             vacant_ok = check_vacancy(tpu_name, zone, max_ssh_tries=1)
+            unknowns = int(out["datasets"] is None) + int(vacant_ok is None)
             if vacant_ok is None:
-                out["status"] = "untrack"
+                out["status"] = "untrack" if unknowns >= 2 else "busy"
             elif not vacant_ok[0] or (key in keys_with_running_jobs):
                 out["status"] = "busy"
             else:
                 env_ok = check_env(tpu_name, zone, max_ssh_tries=1)
+                unknowns += int(env_ok is None)
                 if env_ok is None:
-                    out["status"] = "untrack"
+                    out["status"] = "untrack" if unknowns >= 2 else "busy"
                 elif env_ok:
                     out["status"] = "free"
                 else:
@@ -285,86 +204,6 @@ def sync_state(file_state: FileState, startup: bool=False):
                 file_state._tpus[key[0]].status = out["status"]
 
 
-def submit_job(
-    tpu_size: list[str], region: list[str]|None,
-    run_name: str, project_name: str,
-    command: Optional[str], command_path: Optional[str],
-    datasets: list[DatasetName],
-    priority: int = 0, max_att: int = 0,
-    state_dir: Path = Path(FILE_STATE_DIR),
-) -> int:
-    assert (command_path is None) ^ (command is None), "Exactly one of command and command_path must be provided"
-    if command is None:
-        command = Path(command_path).read_text().strip()  # type: ignore
-    if command.startswith("python "):
-        raise ValueError("Use python3.13 instead of python.")
-    freeze()
-    stage_dir = stage_code(run_name, project_name)
-
-    fs = FileState(state_dir)
-    with fs.transact():
-        job_id = fs._next_job_id
-        fs._next_job_id += 1
-        fs._jobs[job_id] = Job(
-            job_id=job_id,
-            created_at=time.time(),
-            command=command,
-            stage_dir=stage_dir,
-            tpu_size=tpu_size,
-            region=region,
-            run_name=run_name,
-            project_name=project_name,
-            max_att=max_att,
-            status="queued",
-            assigned_tpu=None,
-            attempt=0,
-            priority=priority,
-            datasets=datasets,
-        )
-    thread_log(f"Submitted job {job_id}: run_name={run_name}")
-    return job_id
-
-
-def kill_local_processes(tpu_name: str):
-    """Kill local processes that reference tpu_name."""
-    result = subprocess.run(["pgrep", "-af", tpu_name], capture_output=True, text=True)
-    pattern = re.compile(rf"{re.escape(tpu_name)}([^0-9]|$)")
-    for line in result.stdout.strip().splitlines():
-        parts = line.split(None, 1)
-        pid_str, cmdline = parts[0], parts[1] if len(parts) > 1 else ""
-        if not pattern.search(cmdline):
-            continue
-        try:
-            pid = int(pid_str)
-            if pid != os.getpid():
-                os.kill(pid, signal.SIGKILL)
-                thread_log(f"Killed local process {pid}: {cmdline[:80]}")
-        except (ValueError, ProcessLookupError):
-            pass
-
-def cancel_job(job_id: int, state_dir: Path = Path(FILE_STATE_DIR)):
-    fs = FileState(state_dir)
-
-    with fs.transact():
-        if job_id not in fs._jobs:
-            thread_log(f"Job {job_id} not found.")
-            return
-        job = fs._jobs[job_id]
-        if job.status == "queued":
-            job.assigned_tpu = None
-            job.status = "cancelled"
-            thread_log(f"Cancelled queued job {job_id}")
-            return
-        elif job.status == "running":
-            job.status = "cancelled"
-            thread_log(f"Marked running job {job_id} as cancelled; scheduler will terminate it.")
-            return
-        else:
-            thread_log(f"Job {job_id} is already {job.status}, nothing to cancel.")
-            return
-
-
-
 class Scheduler:
     def __init__(
         self,
@@ -375,8 +214,8 @@ class Scheduler:
         init_workers: int,
         steal_wait: int,
         steal_max: int,
-        tick_interval: int = 30,
-        state_dir: Path = Path(FILE_STATE_DIR),
+        tick_interval: int = 10,
+        state_dir: Path = FILE_STATE_DIR,
     ):
         self.alloc_max = alloc_max
         self.alloc_sizes = alloc_sizes  # Default TPU sizes to allocate
@@ -422,7 +261,7 @@ class Scheduler:
 
 
     def try_alloc(self, worker_id: int, size: str, zone: str) -> bool:
-        tpu = allocate(size, zone, max_retries=8, stop_events=[self._stop_event, self._alloc_sleep_event])
+        tpu = allocate(size, zone, max_attempts=8, stop_events=[self._stop_event, self._alloc_sleep_event])
         if tpu is None:
             thread_log(f"[worker {worker_id}] Failed to allocate {size} in {zone}")
             return False
@@ -479,22 +318,7 @@ class Scheduler:
                 self.file_state._tpus[tpu.name] = ManagedTPU(tpu=tpu, owned=mt.owned, status="free")
             return True
 
-        thread_log(f"[worker {worker_id}] Initialization failed, rebooting: {tpu.name}", force_print=True)
-        if not reboot(tpu):
-            thread_log(f"[worker {worker_id}] Reboot failed, deleting: {tpu.name}", force_print=True)
-            gcloud_delete_tpu(tpu.name, tpu.zone)
-            with self.file_state.transact():
-                self.file_state._tpus.pop(tpu.name, None)
-            return False
-        
-        # Retry after reboot
-        if ensure_ready(tpu, skip_upgrade=skip_upgrade):
-            thread_log(f"[worker {worker_id}] Successfully initialized after reboot: {tpu.name}", force_print=True)
-            with self.file_state.transact():
-                self.file_state._tpus[tpu.name] = ManagedTPU(tpu=tpu, owned=mt.owned, status="free")
-            return True
-
-        thread_log(f"[worker {worker_id}] Initialization still failing after reboot, deleting: {tpu.name}", force_print=True)
+        thread_log(f"[worker {worker_id}] Initialization failed. Deleting: {tpu.name}", force_print=True)
         gcloud_delete_tpu(tpu.name, tpu.zone)
         with self.file_state.transact():
             self.file_state._tpus.pop(tpu.name, None)
@@ -529,27 +353,6 @@ class Scheduler:
     
     # Helpers
 
-    def match_tpu(self, job: Job, tpus: dict[str, ManagedTPU], exclude: set[str] | None = None) -> str | None:
-        """Match a job to a free TPU, preferring dataset-ready then owned TPUs."""
-        if exclude is None:
-            exclude = set()
-        candidates: list[tuple[tuple[int, int, str], str]] = []
-        for tpu_name, mt in tpus.items():
-            if mt.status != "free" or tpu_name in exclude:
-                continue
-            if not tpu_matches_job(mt.tpu, job):
-                continue
-            mounted_datasets = mt.datasets or []
-            missing_datasets = sum(1 for ds in job.datasets if ds not in mounted_datasets)
-            owned_penalty = 0 if mt.owned else 1
-            score = (missing_datasets, owned_penalty, tpu_name)
-            candidates.append((score, tpu_name))
-        if not candidates:
-            return None
-        candidates.sort(key=lambda x: x[0])
-        return candidates[0][1]
-
-
     def summary(self) -> tuple[str, int]:
         _, jobs, tpus = self.file_state.snapshot()
         n_queued_jobs = sum(1 for j in jobs.values() if j.status == "queued")
@@ -577,49 +380,39 @@ class Scheduler:
         return summary, n_owned_tpus
 
     def drain_cancelled_jobs(self):
-        _, jobs, _ = self.file_state.snapshot()
-        pending: dict[int, TPU] = {
-            job.job_id: job.assigned_tpu
-            for job in jobs.values()
-            if job.status == "cancelled" and job.assigned_tpu is not None
-        }
-        if len(pending) == 0:
+        _, jobs, tpus = self.file_state.snapshot()
+        jobs_to_clear = []
+        for job in jobs.values():
+            if job.status != "cancelled" or job.assigned_tpu is None:
+                continue
+
+            tpu = job.assigned_tpu
+            tracked_tpu = tpus.get(tpu.name)
+            if tracked_tpu is None or tracked_tpu.status == "initializing":
+                jobs_to_clear.append(job.job_id)
+                continue
+
+            thread_log(f"Killing processes for cancelled job {job.job_id} on {tpu.name}...")
+            if kill_remote_processes(tpu.name, tpu.zone, job.log_dir):
+                jobs_to_clear.append(job.job_id)
+            else:
+                thread_log(f"Cleanup failed for cancelled job {job.job_id} on {tpu.name}; will retry.")
+        if len(jobs_to_clear) == 0:
             return
 
-        kill_targets: dict[str, TPU] = {}
-        for tpu in pending.values():
-            kill_targets[tpu.name] = tpu
-
-        for tpu in kill_targets.values():
-            thread_log(f"Killing processes for cancelled jobs on {tpu.name}...")
-            kill_local_processes(tpu.name)
-            kill_remote_processes(tpu.name, tpu.zone)
-
-        with self.file_state.transact():
-            running_tpus = {
-                j.assigned_tpu.name
-                for j in self.file_state._jobs.values()
-                if j.status == "running" and j.assigned_tpu is not None
-            }
-            for job_id, expected_tpu in pending.items():
-                job = self.file_state._jobs.get(job_id)
-                if job is None or job.status != "cancelled" or job.assigned_tpu is None:
-                    continue
-                if job.assigned_tpu.name != expected_tpu.name:
+        # State transition: we only change the job status,
+        # and leave the TPU status to be updated by sync_state.
+        fs = self.file_state
+        with fs.transact():
+            for job_id in jobs_to_clear:
+                job = fs._jobs.get(job_id)
+                if job is None or job.status != "cancelled":
                     continue
                 job.assigned_tpu = None
-            for tpu_name, _ in kill_targets.items():
-                mt = self.file_state._tpus.get(tpu_name)
-                if mt is None:
-                    continue
-                if tpu_name in running_tpus:
-                    continue
-                if mt.status == "busy":
-                    mt.status = "free"
 
 
     def steal_tick(self):
-        """Scan for vacant TPUs to steal. After wait period, mark as need_init."""
+        """Steal a TPU for the current _steal_job."""
         if self._steal_target is None:  # Look for fresh target
             job = self._steal_job  # TODO: deal with when job is cancelled here
             assert job is not None
@@ -651,7 +444,7 @@ class Scheduler:
         else:
             job = self._steal_job
             assert job is not None
-            if job.status != "queued":  # The setter of job.status should also set job.assigned_tpu
+            if job.status != "queued":
                 thread_log(f"Current steal target job {job.job_id} is no longer queued. Aborting steal.")
                 self._steal_target = None
                 return
@@ -678,6 +471,7 @@ class Scheduler:
                 if job.status == "queued":
                     thread_log(f"Stealing TPU {tpu.name}. Queued for init.", force_print=True)
                     job.assigned_tpu = tpu
+                    job.status = "matched"
                     self.file_state._tpus[tpu.name] = ManagedTPU(tpu=tpu, owned=False, status="need_init")
             self._steal_target = None
             self._steal_job = None
@@ -697,6 +491,21 @@ class Scheduler:
                     or tracked_job.assigned_tpu.name != mt.tpu.name
                 ):
                     thread_log(f"[job {job.job_id}] no longer runnable before launch, skipping launch")
+                    return
+
+            if not ensure_ready(mt.tpu, skip_upgrade=not mt.owned):
+                thread_log(f"[job {job.job_id}] readiness check failed before launch")
+                self.finalize_job(job, EXIT_CODE_SSH_RETRY)
+                return
+
+            with fs.transact():
+                tracked_job = fs._jobs[job.job_id]
+                if (
+                    tracked_job.status != "running"
+                    or tracked_job.assigned_tpu is None
+                    or tracked_job.assigned_tpu.name != mt.tpu.name
+                ):
+                    thread_log(f"[job {job.job_id}] no longer runnable after readiness check, skipping launch")
                     return
 
             returncode = launch(
@@ -793,7 +602,7 @@ class Scheduler:
                 thread_log(f"[job {job.job_id}] ERROR: TPU {job.assigned_tpu.name} has no num_workers.", force_print=True)
                 continue
 
-            returncode = poll_launch(job.log_dir, job.launch_token, job.assigned_tpu.num_workers)
+            returncode = poll_launch(job.log_dir, job.assigned_tpu.num_workers)
             if returncode is None and job.status == "running":
                 exists, state, health, _ = gcloud_describe_tpu(job.assigned_tpu.name, job.assigned_tpu.zone)
                 if (not exists) or state != "READY" or (health is not None and health != "HEALTHY"):
@@ -830,85 +639,60 @@ class Scheduler:
             self._alloc_sleep_event.clear()
             thread_log(f"{num_owned} owned TPUs, alloc workers active")
         
-        # Job matching
-        matched_pairs: list[tuple[int, str]] = []  # (job_id, tpu_name)
-        to_launch: list[tuple[int, str]] = []
-        first_unmatched: Job | None = None
-        
+        # Update job state
         fs = self.file_state
         with fs.transact():
-            stolen_names = {tpu_name for tpu_name, mt in fs._tpus.items() if not mt.owned}
-            stolen_running = sum(
-                1 for j in fs._jobs.values()
-                if j.status == "running" and j.assigned_tpu
-                and j.assigned_tpu.name in stolen_names
-            )
-            queued_jobs = [
-                j for j in fs._jobs.values()
-                if j.status == "queued"
-            ]
-            queued_jobs.sort(key=lambda j: (-j.priority, j.created_at))
-            
-            # Matches jobs eagerly
-            for job in queued_jobs:
-                if job.assigned_tpu is not None:
-                    assigned_name = job.assigned_tpu.name
-                    assigned_mt = fs._tpus.get(assigned_name)
-                    if assigned_mt is None:
-                        job.assigned_tpu = None
-                        if first_unmatched is None:
-                            first_unmatched = job
-                        continue
-                    if not assigned_mt.owned:
-                        if self.steal_max >= 0 and stolen_running >= self.steal_max:
-                            if first_unmatched is None:
-                                first_unmatched = job
-                            continue
-                        stolen_running += 1
-                    matched_pairs.append((job.job_id, assigned_name))
+            excluded_tpus = set()  # TPUs that already have matched jobs
+            to_launch: list[tuple[int, str]] = []  # (job_id, tpu_name) to launch this turn
+
+            # Check on jobs with "matched" status
+            for job in fs._jobs.values():
+                if job.status != "matched":
                     continue
-                match = self.match_tpu(job, fs._tpus, exclude={tpu_name for _, tpu_name in matched_pairs})
+                assert job.assigned_tpu is not None  # assigned_tpu is guaranteed to exist
+                tpu_name = job.assigned_tpu.name
+                if tpu_name not in fs._tpus:
+                    job.assigned_tpu = None
+                    job.status = "queued"
+                else:
+                    excluded_tpus.add(tpu_name)
+                    if fs._tpus[tpu_name].status == "free":
+                        to_launch.append((job.job_id, tpu_name))
+            
+            # Match queued jobs
+            num_stolen_jobs = count_stolen_jobs(fs._jobs, fs._tpus)
+            queued_jobs = [j for j in fs._jobs.values() if j.status == "queued"]
+            queued_jobs.sort(key=lambda j: (-j.priority, j.created_at))
+
+            first_unmatched: Job | None = None
+            for job in queued_jobs:
+                match = match_job(job, fs._tpus, exclude=excluded_tpus)
                 # If matched a stolen TPU, check budget
                 if match and not fs._tpus[match].owned:
-                    if self.steal_max >= 0 and stolen_running >= self.steal_max:
+                    if self.steal_max >= 0 and num_stolen_jobs >= self.steal_max:
                         match = None
                     else:
-                        stolen_running += 1
+                        num_stolen_jobs += 1
                 if match:
-                    matched_pairs.append((job.job_id, match))
+                    excluded_tpus.add(match)
+                    to_launch.append((job.job_id, match))
                 elif first_unmatched is None:
                     first_unmatched = job
 
-            for job_id, tpu_name in matched_pairs:
-                matched_mt = fs._tpus[tpu_name]
-                matched_job = fs._jobs[job_id]
-                if matched_mt.status != "free":  # still initializing
-                    thread_log(f"Matched TPU {tpu_name} is still in status {matched_mt.status}, skipping...")
-                    continue
-                matched_mt.status = "busy"
-                matched_job.status = "running"
-                matched_job.assigned_tpu = matched_mt.tpu
-                matched_job.attempt += 1
-                to_launch.append((matched_job.job_id, matched_mt.tpu.name))
-        
-        # Launch jobs
-        for job_id, tpu_name in to_launch:
-            with fs.transact():
+            # Launch jobs and transition status
+            for job_id, tpu_name in to_launch:
                 job = fs._jobs[job_id]
                 mt = fs._tpus[tpu_name]
-                if (
-                    job.status != "running"
-                    or job.assigned_tpu is None
-                    or job.assigned_tpu.name != tpu_name
-                ):
-                    continue
-            self.launch_job(job, mt)
+                job.assigned_tpu = mt.tpu
+                job.status = "running"
+                mt.status = "busy"
+                self.launch_job(job, mt)
 
         # Try stealing for first unmatched job if budget allows
         if (
             first_unmatched is not None
             and self.steal_wait >= 0
-            and (self.steal_max < 0 or stolen_running < self.steal_max)
+            and (self.steal_max < 0 or num_stolen_jobs < self.steal_max)
         ):
             if self._steal_job is None:
                 self._steal_job = first_unmatched

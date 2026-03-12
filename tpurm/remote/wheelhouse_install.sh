@@ -5,6 +5,15 @@
 
 : "${GCS_PREFIX:?}"
 
+STAMP_DIR="$HOME/.cache/tpurm"
+STAMP_FILE="$STAMP_DIR/requirements.lock.sha"
+mkdir -p "$STAMP_DIR"
+
+if [ -f "$STAMP_FILE" ] && [ "$(cat "$STAMP_FILE")" = "$REQUIREMENTS_HASH" ]; then
+    echo "[wheelhouse][worker ${WORKER_ID}] requirements already current"
+    exit 0
+fi
+
 sudo rm -rf "$WHEELHOUSE_DIR" "$WHEELHOUSE_TAR"
 
 echo "[wheelhouse][worker ${WORKER_ID}] downloading ${GCS_PREFIX}/wheelhouse_${TAG}_${REQUIREMENTS_HASH}.tar.gz"
@@ -19,3 +28,7 @@ fi
 
 python3.13 -m pip install --no-index --find-links "$WHEELHOUSE_DIR/wheels" \
     -r "$WHEELHOUSE_DIR/requirements.lock"
+
+STAMP_TMP="$(mktemp)"
+printf '%s\n' "$REQUIREMENTS_HASH" > "$STAMP_TMP"
+mv "$STAMP_TMP" "$STAMP_FILE"

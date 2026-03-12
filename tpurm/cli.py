@@ -1,19 +1,82 @@
 import argparse
 import time
 from pathlib import Path
+from typing import Optional, get_args
 
-from .common import thread_log, SUPPORTED_DATASETS
-from .scheduler import FILE_STATE_DIR, Scheduler, cancel_job, submit_job
+from .common import thread_log, DatasetName
+from .scheduler import FILE_STATE_DIR, Scheduler
 from .steal import scan_target
+from .staging import stage_code
+from .state import FileState, Job
 from .freeze import freeze
+
+
+def submit_job(
+    tpu_size: list[str],
+    region: list[str]|None,
+    run_name: str,
+    project_name: str,
+    command: Optional[str],
+    command_path: Optional[str],
+    datasets: list[DatasetName],
+    priority: int,
+    max_att: int,
+    state_dir: Path = FILE_STATE_DIR,
+) -> int:
+    """Appends new jobs in queued state."""
+    assert (command_path is None) ^ (command is None), "Exactly one of command and command_path must be provided"
+    if command is None:
+        command = Path(command_path).read_text().strip()  # type: ignore
+    if command.startswith("python "):
+        raise ValueError("Use python3.13 instead of python.")
+    freeze()
+    stage_dir = stage_code(run_name, project_name)
+
+    fs = FileState(state_dir)
+    with fs.transact():
+        job_id = fs._next_job_id
+        fs._next_job_id += 1
+        fs._jobs[job_id] = Job(
+            job_id=job_id,
+            created_at=time.time(),
+            command=command,
+            tpu_size=tpu_size,
+            region=region,
+            datasets=datasets,
+            run_name=run_name,
+            project_name=project_name,
+            stage_dir=stage_dir,
+            attempt=1,
+            max_att=max_att,
+            priority=priority,
+            assigned_tpu=None,
+            status="queued",
+        )
+    thread_log(f"Submitted job {job_id}: run_name={run_name}")
+    return job_id
+
+
+def cancel_job(job_id: int, state_dir: Path = FILE_STATE_DIR):
+    fs = FileState(state_dir)
+
+    with fs.transact():
+        if job_id not in fs._jobs:
+            thread_log(f"Error: Job {job_id} not found.")
+            return
+        job = fs._jobs[job_id]
+        if job.status == "queued":
+            job.assigned_tpu = None
+            job.status = "cancelled"
+            thread_log(f"Cancelled queued job {job_id}")
+        elif job.status in ("matched", "running"):
+            job.status = "cancelled"
+            thread_log(f"Marked {job.status} job {job_id} as cancelled.")
+        else:
+            thread_log(f"Error: Job {job_id} is already {job.status}.")
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="TPU Job Scheduler")
-    parser.add_argument(
-        "--state-dir", type=Path, default=Path(FILE_STATE_DIR),
-        help="Directory for state.json",
-    )
     subparsers = parser.add_subparsers(dest="action")
 
     # submit
@@ -24,7 +87,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_argument("--project-name", required=True)
     sub.add_argument("--command", default=None)
     sub.add_argument("--command-path", default=None)
-    sub.add_argument("--dataset", nargs="+", choices=SUPPORTED_DATASETS, required=True)
+    sub.add_argument("--dataset", nargs="+", choices=list(get_args(DatasetName)), required=True)
     sub.add_argument("--priority", type=int, default=0, help="Priority of the job")
     sub.add_argument("--max-att", type=int, default=0, help="Max number of attempts (including first run)")
 
@@ -42,7 +105,6 @@ def main(argv: list[str] | None = None) -> int:
 
     # daemon
     sub = subparsers.add_parser("start", help="Run the scheduler daemon")
-    sub.add_argument("--tick-interval", type=int, default=5, help="Seconds between main daemon ticks")
     sub.add_argument("--steal-wait", type=int, default=300, help="Seconds to wait before stealing (-1 to disable)")
     sub.add_argument("--steal-max", type=int, default=2, help="Max jobs on stolen TPUs (-1 for unlimited)")
     sub.add_argument("--alloc-max", type=int, default=4, help="Target number of owned TPUs (0 disables allocation)")
@@ -68,12 +130,11 @@ def main(argv: list[str] | None = None) -> int:
             command=args.command,
             command_path=args.command_path,
             datasets=args.dataset,
-            state_dir=args.state_dir,
             priority=args.priority,
             max_att=args.max_att,
         )
     elif args.action == "cancel":
-        cancel_job(args.job_id, state_dir=args.state_dir)
+        cancel_job(args.job_id)
     elif args.action == "scan":
         vacant = scan_target(args.tpu_size, args.region)
         thread_log(f"\n{len(vacant)} vacant TPU(s) found.", force_print=True)
@@ -88,13 +149,11 @@ def main(argv: list[str] | None = None) -> int:
             init_workers=args.init_workers,
             steal_wait=args.steal_wait,
             steal_max=args.steal_max,
-            tick_interval=args.tick_interval,
-            state_dir=args.state_dir,
         )
         scheduler.run()
 
     elif args.action == "stop":
-        stop_file = Path(args.state_dir) / "tpurm.stop"
+        stop_file = FILE_STATE_DIR / "tpurm.stop"
         stop_file.touch()
         thread_log(f"Stop file created: {stop_file}", force_print=True)
     else:

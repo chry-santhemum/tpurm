@@ -11,7 +11,7 @@ import threading
 import time
 import dotenv
 from pathlib import Path
-from typing import Any, Literal, get_args
+from typing import Any, Literal
 from dataclasses import dataclass, field
 from contextlib import contextmanager
 
@@ -19,10 +19,10 @@ dotenv.load_dotenv(Path.home() / ".env")
 _thread_local = threading.local()
 _THREAD_VAR_MISSING = object()
 
-# TODO: change "size" to "type"
+# TODO: change "size" to "type"?
 
 # Paths
-SCRIPTS_DIR = Path(__file__).resolve().parent
+REMOTE_SCRIPTS_DIR = Path(__file__).resolve().parent / "remote"
 
 def _resolve_repo_root() -> Path:
     env_root = os.environ.get("TPURM_REPO_ROOT")
@@ -41,7 +41,6 @@ NFS_SSD_US = "/kmh-nfs-ssd-us-mount"
 DEFAULT_SA_KEY_FILE: str = os.getenv("DEFAULT_SA_KEY_FILE")  # type: ignore
 DEFAULT_KEYS_DIR: str = os.getenv("DEFAULT_KEYS_DIR")  # type: ignore
 DatasetName = Literal["imagenet", "fineweb10B"]
-SUPPORTED_DATASETS = list(get_args(DatasetName))
 
 # TPU configuration
 # To add a new config: add service accounts, bucket, bucket key
@@ -86,24 +85,6 @@ REGION_BUCKETS = {
 
 AllocMode = Literal["spot", "preemptible", "persistent"]
 
-ALLOCATION_MODES: dict[AllocMode, dict[str, str]] = {
-    "spot": {
-        "direct_flag": "--spot",
-        "queued_flag": "--spot",
-        "provisioning_model": "SPOT",
-    },
-    "preemptible": {
-        "direct_flag": "--pre",
-        "queued_flag": "--best-effort",
-        "provisioning_model": "",
-    },
-    "persistent": {
-        "direct_flag": "",
-        "queued_flag": "",
-        "provisioning_model": "",
-    },
-}
-
 _LOG_MAX_BYTES = 5 * 1024 * 1024
 _LOG_ROTATE_CHECK_EVERY = 200
 
@@ -130,8 +111,7 @@ class TPU:
 
         allowed_zones = self.config["allowed_zones"]
         if self.zone not in self.config["allowed_zones"]:
-            print(f"Error: {self.family} support zones: {allowed_zones}. Requested: {self.zone}", file=sys.stderr)
-            sys.exit(1)
+            raise ValueError(f"{self.family} support zones: {allowed_zones}. Requested: {self.zone}")
 
 def zone_to_region(zone: str) -> str:
     region, part = zone.rsplit("-", 1)
@@ -355,6 +335,7 @@ def gcloud_ssh(
 
     attempts = max(1, max_ssh_tries)
     for attempt in range(1, attempts + 1):
+        retry_reason = ""
         try:
             proc = subprocess.run(
                 cmd,
@@ -365,42 +346,38 @@ def gcloud_ssh(
                 check=False,
             )
             output = _normalize_output(proc.stdout)
+            returncode = proc.returncode
         except subprocess.TimeoutExpired as exc:
             output = _normalize_output(exc.stdout)
-            _append_ssh_log(output)
-            if capture_output and output:
-                captured.append(output)
-            if attempt < attempts:
-                thread_log(
-                    f"SSH command timed out after {timeout}s "
-                    f"(attempt {attempt}/{attempts}); retrying..."
-                )
-                continue
-            thread_log(
-                f"SSH command timed out after {timeout}s "
-                f"(attempt {attempt}/{attempts})"
-            )
-            thread_log(f"SSH attempt limit reached ({attempts}); TPU likely preempted")
-            return SSHResult(status="ssh_retry_exhausted", returncode=-1, stdout="".join(captured))
+            returncode = -1
+            retry_reason = f"timed out after {timeout}s"
 
         _append_ssh_log(output)
         if capture_output and output:
             captured.append(output)
 
-        returncode = proc.returncode if proc.returncode is not None else 1
         if returncode == 0:
             return SSHResult(status="ok", returncode=0, stdout="".join(captured))
 
         # gcloud ssh returns 255 for transport/auth failures; retry those.
-        if returncode == 255 and attempt < attempts:
-            thread_log(
-                f"SSH command failed with return code 255 "
-                f"(attempt {attempt}/{attempts}); retrying..."
-            )
-            continue
         if returncode == 255:
+            retry_reason = "failed with return code 255"
+
+        if retry_reason:
+            if attempt < attempts:
+                thread_log(
+                    f"SSH command {retry_reason} "
+                    f"(attempt {attempt}/{attempts}); retrying..."
+                )
+                continue
+            if returncode != 255:
+                thread_log(
+                    f"SSH command {retry_reason} "
+                    f"(attempt {attempt}/{attempts})"
+                )
             thread_log(f"SSH attempt limit reached ({attempts}); TPU likely preempted")
             return SSHResult(status="ssh_retry_exhausted", returncode=-1, stdout="".join(captured))
+
         return SSHResult(status="error", returncode=returncode, stdout="".join(captured))
 
     # Unreachable, but keeps type checkers happy.
@@ -408,8 +385,7 @@ def gcloud_ssh(
 
 
 def read_remote_script(name: str) -> str:
-    """Read and return the text of a script in scheduler/remote/."""
-    return (SCRIPTS_DIR / "remote" / name).read_text()
+    return (REMOTE_SCRIPTS_DIR / name).read_text()
 
 
 # TODO: fix this?
@@ -498,14 +474,78 @@ def gcloud_describe_tpu(tpu_name: str, zone: str) -> tuple[bool, str | None, str
 # We make the convention that None means "SSH failed"
 
 def check_env(tpu_name: str, zone: str, timeout: float = 15, max_ssh_tries: int=3) -> bool | None:
-    """Check if the software environment is correctly initialized on all workers."""
-    thread_log(f"Checking environment on {tpu_name}...")
+    """Check if the base software environment is initialized on all workers."""
+    thread_log(f"Checking base environment on {tpu_name}...")
     cmd = (
         'wid="${TPU_WORKER_ID:-$(hostname)}"; '
         "mounts=1; test -d /kmh-nfs-us-mount && test -d /kmh-nfs-ssd-us-mount || mounts=0; "
+        "python=1; command -v python3.13 >/dev/null 2>&1 || python=0; "
+        "pip=1; python3.13 -m pip --version >/dev/null 2>&1 || pip=0; "
+        "ok=$((mounts && python && pip)); "
+        'echo "__TPURM_ENV__ worker=${wid} mounts=${mounts} python=${python} pip=${pip} ok=${ok}"; '
+        "exit 0"
+    )
+    try:
+        result = gcloud_ssh(
+            tpu_name, zone, cmd,
+            worker="all",
+            timeout=timeout,
+            capture_output=True,
+            max_ssh_tries=max_ssh_tries,
+        )
+    except subprocess.TimeoutExpired:
+        thread_log(f"SSH timed out: {tpu_name}")
+        return
+    if not result.ok:
+        thread_log(f"SSH failed on {tpu_name}: {result}")
+        return
+
+    by_worker: dict[str, tuple[int, int, int, int]] = {}
+    for line in result.stdout.splitlines():
+        parsed = re.search(
+            r"__TPURM_ENV__ worker=([^ ]+) mounts=([01]) python=([01]) pip=([01]) ok=([01])",
+            line,
+        )
+        if parsed is None:
+            continue
+        worker, mounts, python_ok, pip_ok, ok = parsed.groups()
+        by_worker[worker] = (int(mounts), int(python_ok), int(pip_ok), int(ok))
+
+    if not by_worker:
+        thread_log("Base environment check failed: no parseable env markers returned")
+        return False
+
+    failed = [worker for worker, (_, _, _, ok) in by_worker.items() if ok == 0]
+    if failed:
+        details = ", ".join(
+            f"{worker}(mounts={mounts},python={python_ok},pip={pip_ok})"
+            for worker, (mounts, python_ok, pip_ok, _) in by_worker.items()
+            if worker in failed
+        )
+        thread_log(f"Base environment check failed on workers: {details}")
+        return False
+
+    thread_log("Base environment check: Passed")
+    return True
+
+
+def check_requirements(
+    tpu_name: str,
+    zone: str,
+    requirements_hash: str,
+    timeout: float = 15,
+    max_ssh_tries: int = 3,
+) -> bool | None:
+    """Check whether all workers have the current requirements lock installed."""
+    thread_log(f"Checking requirements on {tpu_name}...")
+    cmd = (
+        f'REQUIREMENTS_HASH={shlex.quote(requirements_hash)}; '
+        'wid="${TPU_WORKER_ID:-$(hostname)}"; '
+        'stamp="$HOME/.cache/tpurm/requirements.lock.sha"; '
+        'hash_ok=0; [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$REQUIREMENTS_HASH" ] && hash_ok=1; '
         "jax_flax=1; python3.13 -c 'import jax; import flax' >/dev/null 2>&1 || jax_flax=0; "
-        "ok=$((mounts && jax_flax)); "
-        'echo "__TPURM_ENV__ worker=${wid} mounts=${mounts} jax_flax=${jax_flax} ok=${ok}"; '
+        "ok=$((hash_ok && jax_flax)); "
+        'echo "__TPURM_REQUIREMENTS__ worker=${wid} hash_ok=${hash_ok} jax_flax=${jax_flax} ok=${ok}"; '
         "exit 0"
     )
     try:
@@ -526,29 +566,29 @@ def check_env(tpu_name: str, zone: str, timeout: float = 15, max_ssh_tries: int=
     by_worker: dict[str, tuple[int, int, int]] = {}
     for line in result.stdout.splitlines():
         parsed = re.search(
-            r"__TPURM_ENV__ worker=([^ ]+) mounts=([01]) jax_flax=([01]) ok=([01])",
+            r"__TPURM_REQUIREMENTS__ worker=([^ ]+) hash_ok=([01]) jax_flax=([01]) ok=([01])",
             line,
         )
         if parsed is None:
             continue
-        worker, mounts, jax_flax, ok = parsed.groups()
-        by_worker[worker] = (int(mounts), int(jax_flax), int(ok))
+        worker, hash_ok, jax_flax, ok = parsed.groups()
+        by_worker[worker] = (int(hash_ok), int(jax_flax), int(ok))
 
     if not by_worker:
-        thread_log("Environment check failed: no parseable env markers returned")
+        thread_log("Requirements check failed: no parseable env markers returned")
         return False
 
     failed = [worker for worker, (_, _, ok) in by_worker.items() if ok == 0]
     if failed:
         details = ", ".join(
-            f"{worker}(mounts={mounts},jax_flax={jax_flax})"
-            for worker, (mounts, jax_flax, _) in by_worker.items()
+            f"{worker}(hash_ok={hash_ok},jax_flax={jax_flax})"
+            for worker, (hash_ok, jax_flax, _) in by_worker.items()
             if worker in failed
         )
-        thread_log(f"Environment check failed on workers: {details}")
+        thread_log(f"Requirements check failed on workers: {details}")
         return False
 
-    thread_log("Environment check: Passed")
+    thread_log("Requirements check: Passed")
     return True
 
 

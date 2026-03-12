@@ -8,7 +8,7 @@ from .common import (
 JAX_LINK = "https://storage.googleapis.com/jax-releases/libtpu_releases.html"
 
 
-def _requirements_hash(path: str) -> str:
+def requirements_hash(path: str) -> str:
     with open(path, "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()[:12]
 
@@ -43,7 +43,7 @@ def tarball_exists(tpu: TPU, requirements_hash: str) -> bool:
 
 def build(tpu: TPU, requirements_lock: str, wheelhouse_dir: str="") -> bool:
     """Build wheel tarball on worker 0 and upload to GCS."""
-    req_hash = _requirements_hash(requirements_lock)
+    req_hash = requirements_hash(requirements_lock)
     thread_log(f"Requirements hash: {req_hash}")
     if tarball_exists(tpu, req_hash):
         thread_log(f"Tarball already exists for hash {req_hash}, skipping build")
@@ -62,7 +62,7 @@ def build(tpu: TPU, requirements_lock: str, wheelhouse_dir: str="") -> bool:
 def install(tpu: TPU, requirements_lock: str, wheelhouse_dir: str="") -> bool:
     """Install wheels from GCS tarball on all workers."""
     thread_log(f"Installing tarball on {tpu.name} ({tpu.zone})")
-    req_hash = _requirements_hash(requirements_lock)
+    req_hash = requirements_hash(requirements_lock)
     env = _env_string(tpu, requirements_lock, req_hash, wheelhouse_dir)
     preamble = read_remote_script("wheelhouse_preamble.sh")
     body = read_remote_script("wheelhouse_install.sh")

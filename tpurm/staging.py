@@ -94,25 +94,46 @@ def stage_code(run_name: str, project_name: str, retain=False, stage_root_dir=NF
     return stage_dir
 
 
-def kill_remote_processes(tpu_name: str, zone: str):
+def kill_remote_processes(tpu_name: str, zone: str, log_dir: str) -> bool:
+    """Kill the TPURM-managed runner process group for one job."""
     thread_log(f"Killing REMOTE processes on {tpu_name}...")
-    cmd = (
-        # Graceful shutdown first, then force-kill stragglers
-        "sudo pkill -15 python || true\n"
-        "sleep 2\n"
-        "sudo pkill -9 python || true\n"
-        # Avoid broad `pkill -f` patterns here: they can match this cleanup shell itself.
-        "sudo pkill -9 zstd || true\n"
-        "sudo pkill -9 pv || true\n"
-        "sudo pkill -9 tar || true\n"
-        "sudo fuser -k 8476/tcp >/dev/null 2>&1 || true\n"
-        "sudo fuser -k /dev/vfio/0 >/dev/null 2>&1 || true\n"
-        "sudo rm -rf /tmp/libtpu_lockfile /tmp/tpu_logs /tmp/*tpu* || true\n"
-        # Wait for coordination service port to be free
-        "for i in $(seq 1 10); do\n"
-        "  sudo fuser 8476/tcp >/dev/null 2>&1 || break\n"
-        "  sleep 3\n"
-        "done\n"
+    cmd = textwrap.dedent(
+        f"""\
+        set -euo pipefail
+        WORKER_ID=${{TPU_WORKER_ID:-$(hostname)}}
+        PID_FILE={shlex.quote(log_dir)}/pid_${{WORKER_ID}}.txt
+        if [ ! -f "$PID_FILE" ]; then
+          exit 0
+        fi
+
+        pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+        case "$pid" in
+          ''|*[!0-9]*)
+            rm -f "$PID_FILE"
+            exit 0
+            ;;
+        esac
+
+        sudo kill -TERM -- "-$pid" >/dev/null 2>&1 || true
+        for i in $(seq 1 10); do
+          if ! sudo kill -0 -- "-$pid" >/dev/null 2>&1; then
+            rm -f "$PID_FILE"
+            exit 0
+          fi
+          sleep 1
+        done
+
+        sudo kill -KILL -- "-$pid" >/dev/null 2>&1 || true
+        for i in $(seq 1 5); do
+          if ! sudo kill -0 -- "-$pid" >/dev/null 2>&1; then
+            rm -f "$PID_FILE"
+            exit 0
+          fi
+          sleep 1
+        done
+
+        exit 1
+        """
     )
     result = gcloud_ssh(
         tpu_name,
@@ -126,8 +147,11 @@ def kill_remote_processes(tpu_name: str, zone: str):
     if not result.ok:
         if result.ssh_retry_exhausted:
             thread_log(f"Failed to kill remote processes on {tpu_name}: SSH retries exhausted (TPU likely preempted)")
+            return True
         else:
             thread_log(f"Failed to kill remote processes on {tpu_name}: exit code {result.returncode}")
+            return False
+    return True
 
 
 def _dataset_warmup_block(tpu: TPU, datasets: list[DatasetName] | None) -> str:
@@ -190,9 +214,6 @@ def launch(
         project_name=project_name,
     )
 
-    # Clean up leftover processes before launching (best-effort).
-    kill_remote_processes(tpu.name, tpu.zone)
-    
     # Build command for each worker
     # rsync from staging dir to local disk
     local_work_dir = f"~/{stage_dir_suffix}"
@@ -230,26 +251,64 @@ def launch(
         """\
         #!/usr/bin/env bash
         set -eo pipefail
-        export PATH="$HOME/.local/bin:$PATH"
-        wandb login {wandb_key}
+        WORKER_ID=${{TPU_WORKER_ID:-$(hostname)}}
+        WORKER_LOG={log_dir}/worker_${{WORKER_ID}}.log
+        BOOTSTRAP_LOG={log_dir}/bootstrap_${{WORKER_ID}}.log
+        EXIT_FILE={log_dir}/exit_${{WORKER_ID}}.txt
+        PID_FILE={log_dir}/pid_${{WORKER_ID}}.txt
 
+        log_bootstrap() {{
+          echo "$(date '+[%y-%m-%d %H:%M:%S]') [bootstrap] $*"
+        }}
+
+        on_term() {{
+          log_bootstrap "SIGTERM stage=$BOOTSTRAP_STAGE pid=$$ ppid=$PPID"
+          exit 143
+        }}
+
+        on_exit() {{
+          rc=$?
+          log_bootstrap "EXIT rc=$rc stage=$BOOTSTRAP_STAGE pid=$$ ppid=$PPID"
+          ps -o pid,ppid,pgid,sid,stat,comm,args -p "$$" -p "$PPID" 2>/dev/null || true
+          echo "$rc" > "$EXIT_FILE"
+          rm -f "$PID_FILE"
+        }}
+
+        exec >> "$BOOTSTRAP_LOG" 2>&1
+        trap on_term TERM
+        trap on_exit EXIT
+
+        export PATH="$HOME/.local/bin:$PATH"
         export ZONE={zone}
         export SERVICE_ACCOUNT={service_account}
 
-        WORKER_ID=${{TPU_WORKER_ID:-$(hostname)}}
-        WORKER_LOG={log_dir}/worker_${{WORKER_ID}}.log
-        EXIT_FILE={log_dir}/exit_${{WORKER_ID}}.{launch_token}
+        BOOTSTRAP_STAGE=wandb_login
+        log_bootstrap "starting $BOOTSTRAP_STAGE"
+        wandb login {wandb_key}
+        log_bootstrap "finished $BOOTSTRAP_STAGE"
 
-        trap 'rc=$?; echo "$rc" > "$EXIT_FILE"' EXIT
-
+        BOOTSTRAP_STAGE=workdir_setup
+        log_bootstrap "starting $BOOTSTRAP_STAGE"
         {workdir_block}
-        {warmup_setup_block}
-        {dataset_block}
+        log_bootstrap "finished $BOOTSTRAP_STAGE"
 
+        BOOTSTRAP_STAGE=warmup_setup
+        log_bootstrap "starting $BOOTSTRAP_STAGE"
+        {warmup_setup_block}
+        log_bootstrap "finished $BOOTSTRAP_STAGE"
+
+        BOOTSTRAP_STAGE=dataset_warmup
+        log_bootstrap "starting $BOOTSTRAP_STAGE"
+        {dataset_block}
+        log_bootstrap "finished $BOOTSTRAP_STAGE"
+
+        BOOTSTRAP_STAGE=train_command
+        log_bootstrap "starting $BOOTSTRAP_STAGE"
         set +e
         stdbuf -oL -eL {real_command} 2>&1 | tee "$WORKER_LOG"
         rc=$?
         set -e
+        log_bootstrap "finished $BOOTSTRAP_STAGE rc=$rc"
         exit "$rc"
         """
     ).format(
@@ -257,7 +316,6 @@ def launch(
         zone=tpu.zone,
         service_account=tpu.service_account,
         log_dir=log_dir,
-        launch_token=launch_token,
         workdir_block=workdir_block,
         warmup_setup_block=warmup_setup_block,
         dataset_block=dataset_block,
@@ -271,14 +329,13 @@ def launch(
         cat > {runner_script_path} <<'TPURM_RUNNER'
         {runner_script}TPURM_RUNNER
         chmod +x {runner_script_path}
-        nohup bash {runner_script_path} >/dev/null 2>&1 < /dev/null &
-        echo $! > {log_dir}/pid_${{WORKER_ID}}.{launch_token}
+        nohup setsid bash {runner_script_path} >/dev/null 2>&1 < /dev/null &
+        echo $! > {log_dir}/pid_${{WORKER_ID}}.txt
         """
     ).format(
         log_dir=log_dir,
         runner_script_path=runner_script_path,
         runner_script=runner_script,
-        launch_token=launch_token,
     )
 
     thread_log(f"Using service account: {tpu.service_account}")
@@ -304,8 +361,8 @@ def launch(
     return returncode
 
 
-def poll_launch(log_dir: str, launch_token: str, expected_workers: int) -> int | None:
-    exit_files = sorted(Path(log_dir).glob(f"exit_*.{launch_token}"))
+def poll_launch(log_dir: str, expected_workers: int) -> int | None:
+    exit_files = sorted(Path(log_dir).glob("exit_*.txt"))
     if len(exit_files) < expected_workers:
         return None
 

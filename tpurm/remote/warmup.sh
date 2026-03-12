@@ -61,31 +61,6 @@ run_check_all() {
 }
 
 
-start_tpu_occupier() {
-  cat > /tmp/tpurm_warmup_occupy.py <<'PY'
-import jax
-import jax.numpy as jnp
-
-x = jnp.ones((1024, 1024), dtype=jnp.bfloat16)
-y = jnp.ones((1024, 1024), dtype=jnp.bfloat16)
-while True:
-    (x @ y).block_until_ready()
-    x, y = y, x
-PY
-  nohup python3.13 /tmp/tpurm_warmup_occupy.py >/tmp/tpurm_warmup_occupy.log 2>&1 < /dev/null &
-  echo "$!" >/tmp/tpurm_warmup_occupy.pid
-}
-
-
-stop_tpu_occupier() {
-  if [ -f /tmp/tpurm_warmup_occupy.pid ]; then
-    kill -9 "$(cat /tmp/tpurm_warmup_occupy.pid)" >/dev/null 2>&1 || true
-  fi
-  pkill -f tpurm_warmup_occupy.py >/dev/null 2>&1 || true
-  rm -f /tmp/tpurm_warmup_occupy.pid /tmp/tpurm_warmup_occupy.py
-}
-
-
 run_body() {
   if [ "$ACTION" = "check" ]; then
     run_check
@@ -176,9 +151,6 @@ run_body() {
   fi
   mkdir -p "$RAMROOT"
 
-  start_tpu_occupier || true
-  trap stop_tpu_occupier EXIT
-
   START=$(date +%s)
   if [ "$DATASET" = "imagenet" ]; then
     BASE="${BASE:-imagenet}"
@@ -237,14 +209,13 @@ run_body() {
 
 if [ "$EUID" -ne 0 ] && [ "$ACTION" = "warmup" ]; then
   echo "[worker] not running as root, rerunning with sudo..."
-  sudo \
+  exec sudo env \
     ACTION="$ACTION" DATASET="$DATASET" \
     GCS_PREFIX="${GCS_PREFIX:-}" BASE="${BASE:-}" FINEWEB10B_SUFFIX="$FINEWEB10B_SUFFIX" \
     TMPFS_MOUNT="$TMPFS_MOUNT" TMPFS_SIZE="$TMPFS_SIZE" \
     DEST="${DEST:-}" CLEAN_DEST="$CLEAN_DEST" \
     REMOUNT_ON_CLEAN_FAIL="$REMOUNT_ON_CLEAN_FAIL" \
-    bash -c "$(declare -f dataset_mount_path_for); $(declare -f dataset_mount_path); $(declare -f run_check); $(declare -f run_check_all); $(declare -f start_tpu_occupier); $(declare -f stop_tpu_occupier); $(declare -f run_body); run_body"
-  exit $?
+    "$0"
 fi
 
 run_body
