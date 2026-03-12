@@ -201,7 +201,12 @@ def sync_state(file_state: FileState, startup: bool=False):
                 file_state._tpus.pop(key[0], None)
             elif file_state._tpus[key[0]].status == read_status[key]:
                 # Only update when status has not been changed since read
-                file_state._tpus[key[0]].status = out["status"]
+                mt = file_state._tpus[key[0]]
+                mt.status = out["status"]
+                if out["num_workers"] is not None:
+                    mt.tpu.num_workers = out["num_workers"]
+                if out["datasets"] is not None:
+                    mt.datasets = out["datasets"]
 
 
 class Scheduler:
@@ -477,35 +482,41 @@ class Scheduler:
             self._steal_job = None
 
 
-    def launch_job(self, job: Job, mt: ManagedTPU):
-        log_path = self.log_dir / f"job_{job.job_id}.log"
+    def launch_job(self, job_id: int, tpu_name: str):
+        log_path = self.log_dir / f"job_{job_id}.log"
         with open(log_path, "a") as log_file, set_thread_vars(log_file=log_file):
-            thread_log(f"[job {job.job_id}] Launching on {mt.tpu.name}...", force_print=True)
+            thread_log(f"[job {job_id}] Launching on {tpu_name}...", force_print=True)
 
             fs = self.file_state
             with fs.transact():
-                tracked_job = fs._jobs[job.job_id]
+                tracked_job = fs._jobs[job_id]
                 if (
                     tracked_job.status != "running"
                     or tracked_job.assigned_tpu is None
-                    or tracked_job.assigned_tpu.name != mt.tpu.name
+                    or tracked_job.assigned_tpu.name != tpu_name
                 ):
-                    thread_log(f"[job {job.job_id}] no longer runnable before launch, skipping launch")
+                    thread_log(f"[job {job_id}] no longer runnable before launch, skipping launch")
                     return
+                tracked_mt = fs._tpus.get(tpu_name)
+                if tracked_mt is None:
+                    thread_log(f"[job {job_id}] TPU {tpu_name} is no longer tracked before launch")
+                    return
+                job = copy.deepcopy(tracked_job)
+                mt = copy.deepcopy(tracked_mt)
 
             if not ensure_ready(mt.tpu, skip_upgrade=not mt.owned):
-                thread_log(f"[job {job.job_id}] readiness check failed before launch")
+                thread_log(f"[job {job_id}] readiness check failed before launch")
                 self.finalize_job(job, EXIT_CODE_SSH_RETRY)
                 return
 
             with fs.transact():
-                tracked_job = fs._jobs[job.job_id]
+                tracked_job = fs._jobs[job_id]
                 if (
                     tracked_job.status != "running"
                     or tracked_job.assigned_tpu is None
-                    or tracked_job.assigned_tpu.name != mt.tpu.name
+                    or tracked_job.assigned_tpu.name != tpu_name
                 ):
-                    thread_log(f"[job {job.job_id}] no longer runnable after readiness check, skipping launch")
+                    thread_log(f"[job {job_id}] no longer runnable after readiness check, skipping launch")
                     return
 
             returncode = launch(
@@ -583,6 +594,7 @@ class Scheduler:
                 elif new_stage_dir is not None:
                     job.status = "queued"
                     job.assigned_tpu = None
+                    job.attempt += 1
                     job.priority += 1
                     job.stage_dir = new_stage_dir
                     thread_log(f"[job {job.job_id}] failed and re-queued (exit {returncode})", force_print=True)
@@ -641,6 +653,7 @@ class Scheduler:
         
         # Update job state
         fs = self.file_state
+        launches: list[tuple[int, str]] = []
         with fs.transact():
             excluded_tpus = set()  # TPUs that already have matched jobs
             to_launch: list[tuple[int, str]] = []  # (job_id, tpu_name) to launch this turn
@@ -686,7 +699,10 @@ class Scheduler:
                 job.assigned_tpu = mt.tpu
                 job.status = "running"
                 mt.status = "busy"
-                self.launch_job(job, mt)
+                launches.append((job_id, tpu_name))
+
+        for job_id, tpu_name in launches:
+            self.launch_job(job_id, tpu_name)
 
         # Try stealing for first unmatched job if budget allows
         if (
