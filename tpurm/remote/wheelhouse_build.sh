@@ -6,6 +6,7 @@
 : "${GCS_PREFIX:?}"
 : "${JAX_LINK:?}"
 : "${REQUIREMENTS_LOCK:?}"
+: "${REQUIREMENTS_HASH:?}"
 
 echo "[wheelhouse][worker ${WORKER_ID}] workdir: $WHEELHOUSE_DIR"
 sudo rm -rf "$WHEELHOUSE_DIR" "$WHEELHOUSE_TAR"

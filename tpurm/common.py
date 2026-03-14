@@ -230,7 +230,6 @@ def thread_log(msg: str, force_print: bool=False):
     else:
         print(line, flush=True)
 
-
 # Shell execution helpers
 # These functions assume thread-local vars have been set by the caller.
 

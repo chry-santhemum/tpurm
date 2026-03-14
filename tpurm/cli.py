@@ -68,9 +68,9 @@ def cancel_job(job_id: int, state_dir: Path = FILE_STATE_DIR):
             job.assigned_tpu = None
             job.status = "cancelled"
             thread_log(f"Cancelled queued job {job_id}")
-        elif job.status in ("matched", "running"):
-            job.status = "cancelled"
+        elif job.status in ("matched", "running"): 
             thread_log(f"Marked {job.status} job {job_id} as cancelled.")
+            job.status = "cancelled"
         else:
             thread_log(f"Error: Job {job_id} is already {job.status}.")
 
@@ -105,7 +105,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # daemon
     sub = subparsers.add_parser("start", help="Run the scheduler daemon")
-    sub.add_argument("--steal-wait", type=int, default=300, help="Seconds to wait before stealing (-1 to disable)")
+    sub.add_argument("--steal-wait", type=int, default=-1, help="Seconds to wait before stealing (-1 to disable)")
     sub.add_argument("--steal-max", type=int, default=2, help="Max jobs on stolen TPUs (-1 for unlimited)")
     sub.add_argument("--alloc-max", type=int, default=4, help="Target number of owned TPUs (0 disables allocation)")
     sub.add_argument("--alloc-sizes", nargs="+", default=["v6e-64", "v5p-64"], help="TPU sizes to allocate")

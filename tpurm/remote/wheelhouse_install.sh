@@ -4,6 +4,7 @@
 # Requires preamble: source wheelhouse_preamble.sh first (concatenated by Python).
 
 : "${GCS_PREFIX:?}"
+: "${REQUIREMENTS_HASH:?}"
 
 STAMP_DIR="$HOME/.cache/tpurm"
 STAMP_FILE="$STAMP_DIR/requirements.lock.sha"

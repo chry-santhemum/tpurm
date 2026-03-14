@@ -11,7 +11,7 @@ import sys
 import textwrap
 import time
 
-from .common import TPU, DatasetName, REPO_ROOT, NFS_SSD_US, thread_log, run_cmd, gcloud_ssh, read_remote_script
+from .common import TPU, DatasetName, DEFAULT_KEYS_DIR, REPO_ROOT, NFS_SSD_US, thread_log, run_cmd, gcloud_ssh, read_remote_script
 
 dotenv.load_dotenv(Path.home() / ".env")
 WANDB_KEY = os.getenv("WANDB_KEY")
@@ -227,6 +227,9 @@ def launch(
     ).strip()
     thread_log(f"Remote local workdir: {local_work_dir}")
     dataset_block = _dataset_warmup_block(tpu, datasets)
+    assert DEFAULT_KEYS_DIR, "DEFAULT_KEYS_DIR must be set"
+    keys_dir = DEFAULT_KEYS_DIR
+    sa_key_file = f"{keys_dir}/bucket-{tpu.region}.json"
     if datasets:
         warmup_script_path = f"/tmp/tpurm_warmup_{launch_token}.sh"
         warmup_heredoc_tag = f"TPURM_WARMUP_{launch_token}"
@@ -281,6 +284,9 @@ def launch(
         export PATH="$HOME/.local/bin:$PATH"
         export ZONE={zone}
         export SERVICE_ACCOUNT={service_account}
+        export SA_KEY_FILE={sa_key_file}
+        export KEYS_DIR={keys_dir}
+        export REGION={region}
 
         BOOTSTRAP_STAGE=wandb_login
         log_bootstrap "starting $BOOTSTRAP_STAGE"
@@ -304,8 +310,13 @@ def launch(
 
         BOOTSTRAP_STAGE=train_command
         log_bootstrap "starting $BOOTSTRAP_STAGE"
+        # TPU images can leave stale driver logs owned by a previous user.
+        sudo mkdir -p /tmp/tpu_logs
+        sudo chown -R "$(id -un):$(id -gn)" /tmp/tpu_logs
+        sudo chmod 755 /tmp/tpu_logs
         set +e
-        stdbuf -oL -eL {real_command} 2>&1 | tee "$WORKER_LOG"
+        # Avoid a tee pipeline here so the wrapper exits when the command exits.
+        stdbuf -oL -eL {real_command} >> "$WORKER_LOG" 2>&1
         rc=$?
         set -e
         log_bootstrap "finished $BOOTSTRAP_STAGE rc=$rc"
@@ -315,6 +326,9 @@ def launch(
         wandb_key=WANDB_KEY,
         zone=tpu.zone,
         service_account=tpu.service_account,
+        sa_key_file=shlex.quote(sa_key_file),
+        keys_dir=shlex.quote(keys_dir),
+        region=shlex.quote(tpu.region),
         log_dir=log_dir,
         workdir_block=workdir_block,
         warmup_setup_block=warmup_setup_block,

@@ -458,9 +458,9 @@ class Scheduler:
             elapsed = time.time() - started_at
             if info is None or not info[0]:
                 if info is None:
-                    thread_log(f"TPU {tpu.name} died. Aborting steal.")
+                    thread_log(f"TPU {tpu.name} died. Aborting steal.", force_print=True)
                 else:
-                    thread_log(f"TPU {tpu.name} became busy ({int(elapsed)}s / {self.steal_wait}s). Aborting steal.")
+                    thread_log(f"TPU {tpu.name} became busy ({int(elapsed)}s / {self.steal_wait}s). Aborting steal.", force_print=True)
                 self._steal_target = None
                 with self.file_state.transact():
                     job = self.file_state._jobs[job.job_id]
@@ -504,20 +504,24 @@ class Scheduler:
                 job = copy.deepcopy(tracked_job)
                 mt = copy.deepcopy(tracked_mt)
 
+            # One last check that TPU is still available
             if not ensure_ready(mt.tpu, skip_upgrade=not mt.owned):
                 thread_log(f"[job {job_id}] readiness check failed before launch")
                 self.finalize_job(job, EXIT_CODE_SSH_RETRY)
                 return
 
-            with fs.transact():
-                tracked_job = fs._jobs[job_id]
-                if (
-                    tracked_job.status != "running"
-                    or tracked_job.assigned_tpu is None
-                    or tracked_job.assigned_tpu.name != tpu_name
-                ):
-                    thread_log(f"[job {job_id}] no longer runnable after readiness check, skipping launch")
-                    return
+            info = check_vacancy(mt.tpu.name, mt.tpu.zone, max_ssh_tries=1)
+            if info is None or not info[0]:
+                with fs.transact():
+                    tracked_job = fs._jobs[job_id]
+                    if tracked_job.status == "running":
+                        thread_log(f"[job {job_id}] TPU no longer vacant after match.", force_print=True)
+                        tracked_job.assigned_tpu = None
+                        tracked_job.status = "queued"
+                    elif tracked_job.status == "cancelled":
+                        thread_log(f"[job {job_id}] cancelled after match.", force_print=True)
+                        tracked_job.assigned_tpu = None
+                return
 
             returncode = launch(
                 mt.tpu, job.command, stage_dir=job.stage_dir,
@@ -539,7 +543,7 @@ class Scheduler:
                     if tracked_job.assigned_tpu is not None:
                         mt = fs._tpus.get(tracked_job.assigned_tpu.name)
                         if mt is not None:
-                            mt.status = "free"
+                            mt.status = "busy"  # let sync_state free it
                     tracked_job.assigned_tpu = None
                     thread_log(f"[job {tracked_job.job_id}] cancelled, skipping retry", force_print=True)
                     return
@@ -574,7 +578,7 @@ class Scheduler:
                     if job.assigned_tpu is not None:
                         mt = fs._tpus.get(job.assigned_tpu.name)
                         if mt is not None:
-                            mt.status = "free"
+                            mt.status = "busy"
                     job.assigned_tpu = None
                     thread_log(f"[job {job.job_id}] cancelled, skipping retry", force_print=True)
                     return
@@ -583,7 +587,7 @@ class Scheduler:
                 assert tpu is not None
                 mt = fs._tpus.get(tpu.name)
                 if mt is not None:
-                    mt.status = "free"
+                    mt.status = "busy"
                     if tpu_dead:
                         fs._tpus.pop(mt.tpu.name, None)
 
