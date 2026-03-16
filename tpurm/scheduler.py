@@ -474,6 +474,13 @@ class Scheduler:
             with self.file_state.transact():
                 job = self.file_state._jobs[job.job_id]
                 if job.status == "queued":
+                    # Get worker count
+                    _, _, _, n_workers = gcloud_describe_tpu(tpu.name, tpu.zone)
+                    if n_workers is None:
+                        thread_log(f"Error ({tpu.name}, {tpu.zone}): Could not get worker count after stealing, TPU likely preempted.")
+                        self._steal_target = None
+                        return
+                    tpu.num_workers = n_workers
                     thread_log(f"Stealing TPU {tpu.name}. Queued for init.", force_print=True)
                     job.assigned_tpu = tpu
                     job.status = "matched"

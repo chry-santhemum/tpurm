@@ -102,7 +102,38 @@ def kill_remote_processes(tpu_name: str, zone: str, log_dir: str) -> bool:
         set -euo pipefail
         WORKER_ID=${{TPU_WORKER_ID:-$(hostname)}}
         PID_FILE={shlex.quote(log_dir)}/pid_${{WORKER_ID}}.txt
+        cleanup_tpu_runtime() {{
+          holder_pids="$(sudo lsof -t -w /dev/accel* /dev/vfio/* 2>/dev/null | sort -u || true)"
+          if [ -n "$holder_pids" ]; then
+            sudo kill -TERM $holder_pids >/dev/null 2>&1 || true
+            for i in $(seq 1 5); do
+              holder_pids="$(sudo lsof -t -w /dev/accel* /dev/vfio/* 2>/dev/null | sort -u || true)"
+              if [ -z "$holder_pids" ]; then
+                break
+              fi
+              sleep 1
+            done
+            if [ -n "$holder_pids" ]; then
+              sudo kill -KILL $holder_pids >/dev/null 2>&1 || true
+              for i in $(seq 1 5); do
+                holder_pids="$(sudo lsof -t -w /dev/accel* /dev/vfio/* 2>/dev/null | sort -u || true)"
+                if [ -z "$holder_pids" ]; then
+                  break
+                fi
+                sleep 1
+              done
+            fi
+          fi
+          holder_pids="$(sudo lsof -t -w /dev/accel* /dev/vfio/* 2>/dev/null | sort -u || true)"
+          if [ -n "$holder_pids" ]; then
+            return 1
+          fi
+          if [ -e /tmp/libtpu_lockfile ]; then
+            sudo rm -f /tmp/libtpu_lockfile
+          fi
+        }}
         if [ ! -f "$PID_FILE" ]; then
+          cleanup_tpu_runtime
           exit 0
         fi
 
@@ -110,6 +141,7 @@ def kill_remote_processes(tpu_name: str, zone: str, log_dir: str) -> bool:
         case "$pid" in
           ''|*[!0-9]*)
             rm -f "$PID_FILE"
+            cleanup_tpu_runtime
             exit 0
             ;;
         esac
@@ -118,6 +150,7 @@ def kill_remote_processes(tpu_name: str, zone: str, log_dir: str) -> bool:
         for i in $(seq 1 10); do
           if ! sudo kill -0 -- "-$pid" >/dev/null 2>&1; then
             rm -f "$PID_FILE"
+            cleanup_tpu_runtime
             exit 0
           fi
           sleep 1
@@ -127,6 +160,7 @@ def kill_remote_processes(tpu_name: str, zone: str, log_dir: str) -> bool:
         for i in $(seq 1 5); do
           if ! sudo kill -0 -- "-$pid" >/dev/null 2>&1; then
             rm -f "$PID_FILE"
+            cleanup_tpu_runtime
             exit 0
           fi
           sleep 1
