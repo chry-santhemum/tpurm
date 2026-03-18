@@ -1,0 +1,14 @@
+WARNING: Could not setup log file in /home/atticusw/.config/gcloud/logs, (PermissionError: [Errno 13] Permission denied: '/home/atticusw/.config/gcloud/logs/2026.03.17/05.18.43.707074.log'.
+The configuration directory may not be writable. To learn more, see https://cloud.google.com/sdk/docs/configurations#creating_a_configuration
+ERROR: (gcloud.compute.tpus.tpu-vm.ssh) You do not currently have an active account selected.
+Please run:
+
+  $ gcloud auth login
+
+to obtain new credentials.
+
+If you have already logged in with a different account, run:
+
+  $ gcloud config set account ACCOUNT
+
+to select an already authenticated account to use.

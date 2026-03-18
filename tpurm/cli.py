@@ -5,8 +5,8 @@ from typing import Optional, get_args
 
 from .common import thread_log, DatasetName
 from .scheduler import FILE_STATE_DIR, Scheduler
-from .steal import scan_target
-from .staging import stage_code
+from .steal import scan_target, get_zone_from_name
+from .staging import stage_code, kill_remote_processes
 from .state import FileState, Job
 from .freeze import freeze
 
@@ -56,6 +56,19 @@ def submit_job(
     return job_id
 
 
+def resume_job(job_id: int, state_dir: Path = FILE_STATE_DIR):
+    fs = FileState(state_dir)
+    with fs.transact():
+        if job_id not in fs._jobs:
+            raise ValueError(f"Job {job_id} not found.")
+        job = fs._jobs[job_id]
+        job.status = "queued"
+        job.attempt = 1
+        if job.assigned_tpu is not None:
+            job.region = [job.assigned_tpu.region]
+    thread_log(f"Resumed job {job_id} at region {job.region}")
+
+
 def cancel_job(job_id: int, state_dir: Path = FILE_STATE_DIR):
     fs = FileState(state_dir)
 
@@ -91,9 +104,17 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_argument("--priority", type=int, default=0, help="Priority of the job")
     sub.add_argument("--max-att", type=int, default=0, help="Max number of attempts (including first run)")
 
+    # resume
+    sub = subparsers.add_parser("resume", help="Resume a job")
+    sub.add_argument("job_id", type=int)
+
     # cancel
     sub = subparsers.add_parser("cancel", help="Cancel a job")
     sub.add_argument("job_id", type=int)
+
+    # kill
+    sub = subparsers.add_parser("kill", help="Kill remote TPU processes by TPU name")
+    sub.add_argument("tpu_name")
     
     # freeze
     sub = subparsers.add_parser("freeze", help="Freeze the environment")
@@ -133,8 +154,13 @@ def main(argv: list[str] | None = None) -> int:
             priority=args.priority,
             max_att=args.max_att,
         )
+    elif args.action == "resume":
+        resume_job(args.job_id)
     elif args.action == "cancel":
         cancel_job(args.job_id)
+    elif args.action == "kill":
+        zone = get_zone_from_name(args.tpu_name)
+        return 0 if kill_remote_processes(args.tpu_name, zone, "/tmp/tpurm-kill-all-no-log-dir") else 1
     elif args.action == "scan":
         vacant = scan_target(args.tpu_size, args.region)
         thread_log(f"\n{len(vacant)} vacant TPU(s) found.", force_print=True)

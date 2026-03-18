@@ -26,10 +26,6 @@ if [ "$ACTION" = "warmup" ]; then
   : "${REGION:?}"
 fi
 
-if [ -z "$SA_KEY_FILE" ] && [ -n "$KEYS_DIR" ] && [ -n "$REGION" ]; then
-  SA_KEY_FILE="${KEYS_DIR%/}/bucket-${REGION}.json"
-fi
-
 
 dataset_mount_path() {
   dataset_mount_path_for "$DATASET"
@@ -166,18 +162,7 @@ run_body() {
   mkdir -p "$RAMROOT"
 
   START=$(date +%s)
-  if [ -n "$SA_KEY_FILE" ]; then
-    if [ -f "$SA_KEY_FILE" ]; then
-      export GOOGLE_APPLICATION_CREDENTIALS="$SA_KEY_FILE"
-      current_account="$(gcloud config get-value account 2>/dev/null || true)"
-      if [ -n "$SERVICE_ACCOUNT" ] && [ "$current_account" != "$SERVICE_ACCOUNT" ]; then
-        echo "[worker] activating service account via $SA_KEY_FILE"
-        gcloud auth activate-service-account --key-file="$SA_KEY_FILE"
-      fi
-    else
-      echo "[worker] WARN: key file not found: $SA_KEY_FILE"
-    fi
-  fi
+  setup_gcloud_auth "[worker]"
   if [ "$DATASET" = "imagenet" ]; then
     BASE="${BASE:-imagenet}"
     echo "[worker] listing parts: ${GCS_PREFIX}/${BASE}.tar*"
@@ -243,7 +228,7 @@ if [ "$EUID" -ne 0 ] && [ "$ACTION" = "warmup" ]; then
     SERVICE_ACCOUNT="$SERVICE_ACCOUNT" SA_KEY_FILE="$SA_KEY_FILE" \
     KEYS_DIR="$KEYS_DIR" REGION="$REGION" \
     REMOUNT_ON_CLEAN_FAIL="$REMOUNT_ON_CLEAN_FAIL" \
-    "$0"
+    bash "$0"
 fi
 
 run_body

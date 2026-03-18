@@ -330,7 +330,7 @@ def gcloud_ssh(
             if not output.endswith("\n"):
                 ssh_log.write("\n")
             ssh_log.flush()
-            _bump_log_rotation_check(ssh_log)
+            _maybe_rotate_log(ssh_log)
 
     attempts = max(1, max_ssh_tries)
     for attempt in range(1, attempts + 1):
@@ -385,6 +385,10 @@ def gcloud_ssh(
 
 def read_remote_script(name: str) -> str:
     return (REMOTE_SCRIPTS_DIR / name).read_text()
+
+
+def compose_remote_script(*names: str) -> str:
+    return "\n\n".join(read_remote_script(name).rstrip() for name in names) + "\n"
 
 
 # TODO: fix this?
@@ -595,7 +599,7 @@ def check_datasets_mounts(tpu_name: str, zone: str, timeout: float = 15, max_ssh
     """
     Check mount presence for multiple datasets.
     """
-    script = read_remote_script("warmup.sh")
+    script = compose_remote_script("gcloud_auth.sh", "warmup.sh")
     cmd = f"ACTION=check_all bash -s <<'REMOTE_SCRIPT'\n{script}\nREMOTE_SCRIPT"
 
     try:
@@ -637,7 +641,9 @@ def check_vacancy(tpu_name: str, zone: str, timeout: float = 15, max_ssh_tries: 
     vacant=None means SSH failed.
     """
     cmd = (
-        "lsof /dev/accel* 2>/dev/null || true; "
+        "sudo lsof -w /dev/accel* /dev/vfio/* 2>/dev/null || true; "
+        "echo ---MARKER---; "
+        "if [ -e /tmp/libtpu_lockfile ]; then echo PRESENT; fi; "
         "echo ---MARKER---; "
         "pgrep -af 'python|pip|gsutil|gcloud|apt-get|dpkg|zstd' 2>/dev/null | grep -v MARKER | grep -v networkd-dispatcher | grep -v unattended-upgrade || true; "
         "echo ---MARKER---; "
@@ -659,25 +665,33 @@ def check_vacancy(tpu_name: str, zone: str, timeout: float = 15, max_ssh_tries: 
         return
 
     parts = result.stdout.split("---MARKER---")
-    raw_accel_output = parts[0].strip() if len(parts) > 0 else ""
-    python_output = parts[1].strip() if len(parts) > 1 else ""
-    load_output = parts[2].strip() if len(parts) > 2 else ""
+    raw_holder_output = parts[0].strip() if len(parts) > 0 else ""
+    lockfile_output = parts[1].strip() if len(parts) > 1 else ""
+    python_output = parts[2].strip() if len(parts) > 2 else ""
+    load_output = parts[3].strip() if len(parts) > 3 else ""
 
-    # Ignore gcloud SSH preamble chatter and only keep real lsof hits.
-    accel_lines = [line for line in raw_accel_output.splitlines() if "/dev/accel" in line]
-    accel_output = "\n".join(accel_lines).strip()
+    holder_lines = [line for line in raw_holder_output.splitlines() if "/dev/accel" in line or "/dev/vfio" in line]
+    holder_output = "\n".join(holder_lines).strip()
+    lockfile_present = lockfile_output == "PRESENT"
     
     tpu = name_to_tpu(tpu_name, zone)
     if tpu is not None and tpu.owner == "atticusw":
         if python_output != "":
             python_examples = "\n".join(python_output.split("\n")[:1])
             thread_log(f"  {tpu_name}: python process example:\n{python_examples}")
-        if accel_output != "":
-            accel_examples = "\n".join(accel_output.split("\n")[:3])
-            thread_log(f"  {tpu_name}: accel process examples:\n{accel_examples}")
+        if holder_output != "":
+            holder_examples = "\n".join(holder_output.split("\n")[:3])
+            thread_log(f"  {tpu_name}: TPU holder examples:\n{holder_examples}")
+        if lockfile_present:
+            thread_log(f"  {tpu_name}: /tmp/libtpu_lockfile present")
         thread_log(f"  {tpu_name}: load output:\n{load_output}")
 
-    load_1m = float(load_output.split()[0]) if load_output else 999.0
-    load_5m = float(load_output.split()[1]) if load_output else 999.0
-    vacant = (accel_output == "") and (python_output == "") and (load_5m < 2.0 or load_1m < 1.0)
+    load_parts = load_output.split()
+    try:
+        load_1m = float(load_parts[0]) if len(load_parts) >= 1 else 999.0
+        load_5m = float(load_parts[1]) if len(load_parts) >= 2 else 999.0
+    except ValueError:
+        load_1m = 999.0
+        load_5m = 999.0
+    vacant = (holder_output == "") and (not lockfile_present) and (python_output == "") and (load_5m < 2.0 or load_1m < 1.0)
     return vacant, load_output

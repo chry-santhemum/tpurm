@@ -239,11 +239,8 @@ class Scheduler:
         self._stop_event = threading.Event()
 
         # Communication with alloc workers
-        # The workers can only pop from the queue
         # Event is set by the alloc monitor
         self._alloc_sleep_event = threading.Event()
-        self._alloc_queue: list[tuple[str, str]] = []  # (size, zone)
-        self._alloc_queue_lock = threading.Lock()
 
         # Communication with stealing
         self._steal_job: Job|None = None
@@ -284,7 +281,11 @@ class Scheduler:
             if self.alloc_regions is not None:
                 allowed_zones = [z for z in allowed_zones if zone_to_region(z) in self.alloc_regions]
             default_combo.extend([(size, zone) for zone in allowed_zones])
-        curr_pointer = 0
+        default_combo_pointer = 0
+
+        curr_combo = []
+        curr_job_id = None
+        curr_combo_pointer = 0
 
         with open(log_path, "w") as log_file, set_thread_vars(log_file=log_file):
             while True:
@@ -294,22 +295,31 @@ class Scheduler:
                 if self._alloc_sleep_event.is_set():
                     self._stop_event.wait(30)
                     continue
-                
-                size, zone = None, None
-                with self._alloc_queue_lock:
-                    if self._alloc_queue:
-                        size, zone = self._alloc_queue.pop(0)
-                
-                if size is not None:  # alloc queue was nonempty
-                    assert zone is not None  # for type check
-                    curr_pointer = 0
-                else:
+
+                _, jobs, _ = self.file_state.snapshot()
+                queued_jobs = [j for j in jobs.values() if j.status == "queued"]
+                queued_jobs.sort(key=lambda j: (-j.priority, j.created_at))
+                if len(queued_jobs) == 0:
                     if len(default_combo) == 0:
-                        self._stop_event.wait(30)
-                        continue
-                    size, zone = default_combo[curr_pointer]
-                    curr_pointer = (curr_pointer + 1) % len(default_combo)
-                
+                        raise ValueError("No tpu_size/region combination is possible")
+                    size, zone = default_combo[default_combo_pointer]
+                    default_combo_pointer = (default_combo_pointer + 1) % len(default_combo)
+                else:  # allocate at queued job location
+                    default_combo_pointer = 0  # reset default pointer
+                    job = queued_jobs[0]
+                    if job.job_id != curr_job_id:
+                        # new job, reset curr_combo
+                        curr_job_id = job.job_id
+                        curr_combo.clear()
+                        curr_combo_pointer = 0
+                        for size in job.tpu_size:
+                            allowed_zones = TPU_CONFIGS[size_to_family(size)]["allowed_zones"]
+                            if job.region is not None:
+                                allowed_zones = [z for z in allowed_zones if zone_to_region(z) in job.region]
+                            curr_combo.extend([(size, zone) for zone in allowed_zones])
+                    size, zone = curr_combo[curr_combo_pointer]
+                    curr_combo_pointer = (curr_combo_pointer + 1) % len(curr_combo)
+                    
                 self.try_alloc(worker_id, size, zone)
 
 

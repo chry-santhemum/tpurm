@@ -2,7 +2,7 @@ import hashlib
 import shlex
 from .common import (
     TPU, DEFAULT_KEYS_DIR,
-    gcloud_ssh, thread_log, read_remote_script,
+    compose_remote_script, gcloud_ssh, thread_log, read_remote_script,
 )
 
 JAX_LINK = "https://storage.googleapis.com/jax-releases/libtpu_releases.html"
@@ -40,7 +40,7 @@ def tarball_exists(tpu: TPU, requirements_hash: str) -> bool:
     uri = f"{tpu.bucket}/atticusw/wheelhouse/wheelhouse_{tpu.wheelhouse_tag}_{requirements_hash}.tar.gz"
     thread_log(f"Checking if tarball exists: {uri}")
     env = _env_string(tpu, requirements_hash=requirements_hash)
-    preamble = read_remote_script("wheelhouse_preamble.sh")
+    preamble = compose_remote_script("gcloud_auth.sh", "wheelhouse_preamble.sh")
     full_cmd = f"{env} bash -s <<'REMOTE'\n{preamble}\ngcloud storage ls {shlex.quote(uri)} >/dev/null 2>&1\nREMOTE"
     result = gcloud_ssh(tpu.name, tpu.zone, full_cmd, worker="0", timeout=60, capture_output=False, max_ssh_tries=3)
     return result.ok
@@ -55,7 +55,7 @@ def build(tpu: TPU, requirements_lock: str, wheelhouse_dir: str="") -> bool:
         return True
     thread_log(f"Building tarball on {tpu.name} ({tpu.zone})")
     env = _env_string(tpu, requirements_lock=requirements_lock, requirements_hash=req_hash, wheelhouse_dir=wheelhouse_dir)
-    preamble = read_remote_script("wheelhouse_preamble.sh")
+    preamble = compose_remote_script("gcloud_auth.sh", "wheelhouse_preamble.sh")
     body = read_remote_script("wheelhouse_build.sh")
     full_cmd = f"{env} bash -s <<'REMOTE'\n" + preamble + '\n' + body + "\nREMOTE"
     result = gcloud_ssh(tpu.name, tpu.zone, full_cmd, worker="0", timeout=None, capture_output=False, max_ssh_tries=3)
@@ -69,7 +69,7 @@ def install(tpu: TPU, requirements_lock: str, wheelhouse_dir: str="") -> bool:
     thread_log(f"Installing tarball on {tpu.name} ({tpu.zone})")
     req_hash = requirements_hash(requirements_lock)
     env = _env_string(tpu, requirements_lock=requirements_lock, requirements_hash=req_hash, wheelhouse_dir=wheelhouse_dir)
-    preamble = read_remote_script("wheelhouse_preamble.sh")
+    preamble = compose_remote_script("gcloud_auth.sh", "wheelhouse_preamble.sh")
     body = read_remote_script("wheelhouse_install.sh")
     full_cmd = f"{env} bash -s <<'REMOTE'\n" + preamble + '\n' + body + "\nREMOTE"
     result = gcloud_ssh(tpu.name, tpu.zone, full_cmd, worker="all", timeout=None, capture_output=False, max_ssh_tries=3)
