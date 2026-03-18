@@ -8,6 +8,12 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if ! declare -F setup_gcloud_auth >/dev/null 2>&1 && [ -f "$SCRIPT_DIR/gcloud_auth.sh" ]; then
+  # shellcheck source=./gcloud_auth.sh
+  source "$SCRIPT_DIR/gcloud_auth.sh"
+fi
+
 ACTION="${ACTION:-warmup}"
 DATASET="${DATASET:-imagenet}"
 FINEWEB10B_SUFFIX="${FINEWEB10B_SUFFIX:-bin}"

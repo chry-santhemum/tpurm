@@ -13,7 +13,7 @@ import time
 
 from .common import (
     TPU, DatasetName, DEFAULT_KEYS_DIR, REPO_ROOT, NFS_SSD_US,
-    gcloud_ssh, read_remote_script, run_cmd, thread_log,
+    gcloud_ssh, run_cmd, thread_log,
 )
 
 dotenv.load_dotenv(Path.home() / ".env")
@@ -191,35 +191,6 @@ def kill_remote_processes(tpu_name: str, zone: str, log_dir: str) -> bool:
     return True
 
 
-def _dataset_warmup_block(tpu: TPU, datasets: list[DatasetName] | None) -> str:
-    if not datasets:
-        return "echo '[worker] no dataset warmup requested'"
-
-    lines = []
-    for dataset in datasets:
-        gcs_subpath = "data/imagenet" if dataset == "imagenet" else "data/fineweb10B"
-        gcs_prefix = f"{tpu.bucket}/{gcs_subpath}"
-        clean_dest = "false" if dataset == "imagenet" else "true"
-        lines.extend([
-            f'echo "[worker] ensuring dataset {dataset}..."',
-            (
-                f'if ACTION=check DATASET={shlex.quote(dataset)} bash "$WARMUP_SCRIPT" | grep -q YES; then\n'
-                f'  echo "[worker] dataset {dataset} already present"\n'
-                'else\n'
-                f'  ACTION=warmup DATASET={shlex.quote(dataset)} '
-                f'GCS_PREFIX={shlex.quote(gcs_prefix)} BASE=imagenet FINEWEB10B_SUFFIX=bin '
-                f'TMPFS_MOUNT=/mnt/atticusw TMPFS_SIZE=270G CLEAN_DEST={clean_dest} REMOUNT_ON_CLEAN_FAIL=true '
-                'bash "$WARMUP_SCRIPT"\n'
-                f'  if ! ACTION=check DATASET={shlex.quote(dataset)} bash "$WARMUP_SCRIPT" | grep -q YES; then\n'
-                f'    echo "[worker] ERROR: dataset {dataset} still missing after warmup" >&2\n'
-                '    exit 11\n'
-                '  fi\n'
-                'fi'
-            ),
-        ])
-    return "\n".join(lines)
-
-
 def stage_dir_to_log_dir(stage_dir: str) -> str:
     stage_dir_suffix = stage_dir.split("/staging/")[-1]
     return f"{NFS_SSD_US}/logs/{stage_dir_suffix}"
@@ -239,7 +210,6 @@ def launch(
     which will be replaced with the corresponding arguments.
     """
     stage_dir_suffix = stage_dir.split("/staging/")[-1]
-    launch_token = stage_dir.split("/")[-1].split("__")[-2]
     log_dir = stage_dir_to_log_dir(stage_dir)
     os.makedirs(log_dir, exist_ok=True)
     os.chmod(log_dir, 0o777)
@@ -251,136 +221,42 @@ def launch(
         project_name=project_name,
     )
 
-    # Build command for each worker
-    # rsync from staging dir to local disk
-    local_work_dir = f"~/{stage_dir_suffix}"
-    workdir_block = textwrap.dedent(
-        f"""\
-        for i in $(seq 1 10); do ls {stage_dir}/ > /dev/null 2>&1 && break; echo 'Waiting for NFS...'; sleep 3; done
-        mkdir -p {local_work_dir}
-        rsync -a {stage_dir}/ {local_work_dir}/
-        cd {local_work_dir}
-        """
-    ).strip()
-    thread_log(f"Remote local workdir: {local_work_dir}")
     assert DEFAULT_KEYS_DIR, "DEFAULT_KEYS_DIR must be set"
     keys_dir = DEFAULT_KEYS_DIR
     sa_key_file = f"{keys_dir}/bucket-{tpu.region}.json"
-    auth_script = read_remote_script("gcloud_auth.sh")
-    warmup_script_path = f"/tmp/tpurm_warmup_{launch_token}.sh"
-    warmup_heredoc_tag = f"TPURM_WARMUP_{launch_token}"
+    runner_script_path = f"{stage_dir}/tpurm/remote/launch_runner.sh"
+    datasets_env = " ".join(datasets or [])
     thread_log(f"Using service account: {tpu.service_account}")
     thread_log(f"Running at {tpu.name} {tpu.zone}")
     thread_log(f"Experiment logs at: {log_dir}", force_print=True)
-
-    warmup_block = ""
-    if datasets:
-        dataset_block = textwrap.indent(_dataset_warmup_block(tpu, datasets), "  ")
-        warmup_script = read_remote_script("warmup.sh").rstrip()
-        warmup_block = (
-            f'WARMUP_LOG={log_dir}/warmup_${{WORKER_ID}}.log\n'
-            'BOOTSTRAP_STAGE=dataset_warmup\n'
-            'log_bootstrap "starting $BOOTSTRAP_STAGE"\n'
-            '(\n'
-            '  exec >> "$WARMUP_LOG" 2>&1\n'
-            f'  WARMUP_SCRIPT={shlex.quote(warmup_script_path)}\n'
-            f"  cat > \"$WARMUP_SCRIPT\" <<'{warmup_heredoc_tag}'\n"
-            f"{warmup_script}\n"
-            f"{warmup_heredoc_tag}\n"
-            '  chmod +x "$WARMUP_SCRIPT"\n'
-            f"{dataset_block}\n"
-            ')\n'
-            'log_bootstrap "finished $BOOTSTRAP_STAGE"\n\n'
-        )
-
-    runner_script_path = f"$HOME/{launch_token}.sh"
-    runner_script = textwrap.dedent(
-        """\
-        #!/usr/bin/env bash
-        set -eo pipefail
-        WORKER_ID=${{TPU_WORKER_ID:-$(hostname)}}
-        WORKER_LOG={log_dir}/worker_${{WORKER_ID}}.log
-        BOOTSTRAP_LOG={log_dir}/bootstrap_${{WORKER_ID}}.log
-        EXIT_FILE={log_dir}/exit_${{WORKER_ID}}.txt
-        PID_FILE={log_dir}/pid_${{WORKER_ID}}.txt
-
-        log_bootstrap() {{
-          echo "$(date '+[%y-%m-%d %H:%M:%S]') [bootstrap] $*"
-        }}
-
-        on_term() {{
-          log_bootstrap "SIGTERM stage=$BOOTSTRAP_STAGE pid=$$ ppid=$PPID"
-          exit 143
-        }}
-
-        on_exit() {{
-          rc=$?
-          log_bootstrap "EXIT rc=$rc stage=$BOOTSTRAP_STAGE pid=$$ ppid=$PPID"
-          ps -o pid,ppid,pgid,sid,stat,comm,args -p "$$" -p "$PPID" 2>/dev/null || true
-          echo "$rc" > "$EXIT_FILE"
-          rm -f "$PID_FILE"
-        }}
-
-        exec >> "$BOOTSTRAP_LOG" 2>&1
-        trap on_term TERM
-        trap on_exit EXIT
-
-        export PATH="$HOME/.local/bin:$PATH"
-        export ZONE={zone}
-        export SERVICE_ACCOUNT={service_account}
-        export SA_KEY_FILE={sa_key_file}
-        export KEYS_DIR={keys_dir}
-        export REGION={region}
-
-        {auth_script}
-        setup_gcloud_auth "[bootstrap]"
-
-        {warmup_block}
-        BOOTSTRAP_STAGE=wandb_login
-        log_bootstrap "starting $BOOTSTRAP_STAGE"
-        wandb login {wandb_key}
-        log_bootstrap "finished $BOOTSTRAP_STAGE"
-
-        BOOTSTRAP_STAGE=workdir_setup
-        log_bootstrap "starting $BOOTSTRAP_STAGE"
-        {workdir_block}
-        log_bootstrap "finished $BOOTSTRAP_STAGE"
-
-        BOOTSTRAP_STAGE=train_command
-        log_bootstrap "starting $BOOTSTRAP_STAGE"
-        # TPU images can leave stale driver logs owned by a previous user.
-        sudo mkdir -p /tmp/tpu_logs
-        sudo chown -R "$(id -un):$(id -gn)" /tmp/tpu_logs
-        sudo chmod 755 /tmp/tpu_logs
-        set +e
-        # Avoid a tee pipeline here so the wrapper exits when the command exits.
-        stdbuf -oL -eL {real_command} >> "$WORKER_LOG" 2>&1
-        rc=$?
-        set -e
-        log_bootstrap "finished $BOOTSTRAP_STAGE rc=$rc"
-        exit "$rc"
-        """
-    ).format(
-        wandb_key=WANDB_KEY,
-        zone=tpu.zone,
-        service_account=tpu.service_account,
-        sa_key_file=shlex.quote(sa_key_file),
-        keys_dir=shlex.quote(keys_dir),
-        region=shlex.quote(tpu.region),
-        log_dir=log_dir,
-        workdir_block=workdir_block,
-        auth_script=auth_script,
-        warmup_block=warmup_block,
-        real_command=real_command,
-    )
+    launch_env = {
+        "LOG_DIR": log_dir,
+        "STAGE_DIR": stage_dir,
+        "STAGE_DIR_SUFFIX": stage_dir_suffix,
+        "TRAIN_COMMAND": real_command,
+        "WANDB_KEY": WANDB_KEY or "",
+        "DATASETS": datasets_env,
+        "TPU_BUCKET": tpu.bucket,
+        "ZONE": tpu.zone,
+        "SERVICE_ACCOUNT": tpu.service_account,
+        "SA_KEY_FILE": sa_key_file,
+        "KEYS_DIR": keys_dir,
+        "REGION": tpu.region,
+    }
+    env_string = " ".join(f"{name}={shlex.quote(value)}" for name, value in launch_env.items())
 
     remote_cmd = textwrap.dedent(
-        """\
+        f"""\
         set -eo pipefail
         WORKER_ID=${{TPU_WORKER_ID:-$(hostname)}}
-        PID_FILE={log_dir}/pid_${{WORKER_ID}}.txt
-        EXIT_FILE={log_dir}/exit_${{WORKER_ID}}.txt
-        RUNNER_SCRIPT="{runner_script_path}"
+        PID_FILE={shlex.quote(log_dir)}/pid_${{WORKER_ID}}.txt
+        EXIT_FILE={shlex.quote(log_dir)}/exit_${{WORKER_ID}}.txt
+        RUNNER_SCRIPT={shlex.quote(runner_script_path)}
+        for i in $(seq 1 10); do [ -f "$RUNNER_SCRIPT" ] && break; echo 'Waiting for NFS...'; sleep 3; done
+        if [ ! -f "$RUNNER_SCRIPT" ]; then
+          echo "runner script missing: $RUNNER_SCRIPT" >&2
+          exit 1
+        fi
         # SSH retries can partially dispatch workers, so launching must be idempotent.
         existing_pid="$(pgrep -u "$(id -u)" -f -x "bash $RUNNER_SCRIPT" | head -n1 || true)"
         if [ -n "$existing_pid" ]; then
@@ -390,16 +266,9 @@ def launch(
         if [ -f "$EXIT_FILE" ]; then
           exit 0
         fi
-        cat > "$RUNNER_SCRIPT" <<'TPURM_RUNNER'
-        {runner_script}TPURM_RUNNER
-        chmod +x "$RUNNER_SCRIPT"
-        nohup setsid bash "$RUNNER_SCRIPT" >/dev/null 2>&1 < /dev/null &
+        nohup setsid env {env_string} bash "$RUNNER_SCRIPT" >/dev/null 2>&1 < /dev/null &
         echo $! > "$PID_FILE"
         """
-    ).format(
-        log_dir=log_dir,
-        runner_script_path=runner_script_path,
-        runner_script=runner_script,
     )
     result = gcloud_ssh(
         tpu.name, tpu.zone, remote_cmd, 
