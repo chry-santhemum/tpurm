@@ -12,7 +12,7 @@ import textwrap
 import time
 
 from .common import (
-    TPU, DatasetName, DEFAULT_KEYS_DIR, REPO_ROOT, NFS_SSD_US,
+    TPU, DatasetName, DEFAULT_KEYS_DIR, REPO_ROOT, REMOTE_SCRIPTS_DIR, NFS_SSD_US,
     gcloud_ssh, run_cmd, thread_log,
 )
 
@@ -75,6 +75,16 @@ def stage_code(run_name: str, project_name: str, retain=False, stage_root_dir=NF
     result = run_cmd(
         ["rsync", "-aL", "--files-from=-", str(REPO_ROOT) + "/", stage_dir],  # materialize symlinked files
         input=files_from_input, text=True,
+    )
+    if result is None or result.returncode != 0:
+        print(f"ERROR: rsync failed (exit code {result.returncode if result else 'N/A'})", file=sys.stderr)
+        sys.exit(1)
+
+    remote_stage_dir = Path(stage_dir, ".tpurm", "remote")
+    remote_stage_dir.mkdir(parents=True, exist_ok=True)
+    result = run_cmd(
+        ["rsync", "-a", str(REMOTE_SCRIPTS_DIR) + "/", str(remote_stage_dir) + "/"],
+        text=True,
     )
     if result is None or result.returncode != 0:
         print(f"ERROR: rsync failed (exit code {result.returncode if result else 'N/A'})", file=sys.stderr)
@@ -194,7 +204,7 @@ def kill_remote_processes(tpu_name: str, zone: str, log_dir: str) -> bool:
 def stage_dir_to_log_dir(stage_dir: str) -> str:
     stage_dir_suffix = stage_dir.split("/staging/")[-1]
     return f"{NFS_SSD_US}/logs/{stage_dir_suffix}"
-    
+
 def launch(
     tpu: TPU,
     command: str,
@@ -224,7 +234,7 @@ def launch(
     assert DEFAULT_KEYS_DIR, "DEFAULT_KEYS_DIR must be set"
     keys_dir = DEFAULT_KEYS_DIR
     sa_key_file = f"{keys_dir}/bucket-{tpu.region}.json"
-    runner_script_path = f"{stage_dir}/tpurm/remote/launch_runner.sh"
+    runner_script_path = f"{stage_dir}/.tpurm/remote/launch_runner.sh"
     datasets_env = " ".join(datasets or [])
     thread_log(f"Using service account: {tpu.service_account}")
     thread_log(f"Running at {tpu.name} {tpu.zone}")

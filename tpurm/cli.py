@@ -81,7 +81,7 @@ def cancel_job(job_id: int, state_dir: Path = FILE_STATE_DIR):
             job.assigned_tpu = None
             job.status = "cancelled"
             thread_log(f"Cancelled queued job {job_id}")
-        elif job.status in ("matched", "running"): 
+        elif job.status in ("waiting", "running"): 
             thread_log(f"Marked {job.status} job {job_id} as cancelled.")
             job.status = "cancelled"
         else:
@@ -155,9 +155,9 @@ def main(argv: list[str] | None = None) -> int:
             max_att=args.max_att,
         )
     elif args.action == "resume":
-        resume_job(args.job_id)
+        resume_job(args.id)
     elif args.action == "cancel":
-        cancel_job(args.job_id)
+        cancel_job(args.id)
     elif args.action == "kill":
         zone = get_zone_from_name(args.tpu_name)
         return 0 if kill_remote_processes(args.tpu_name, zone, "/tmp/tpurm-kill-all-no-log-dir") else 1

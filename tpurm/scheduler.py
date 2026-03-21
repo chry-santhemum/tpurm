@@ -89,7 +89,7 @@ def count_stolen_jobs(jobs: dict[int, Job], tpus: dict[str, ManagedTPU]) -> int:
     stolen_names = {tpu_name for tpu_name, mt in tpus.items() if not mt.owned}
     return sum(
         1 for j in jobs.values()
-        if j.status in ("matched", "running")
+        if j.status in ("waiting", "running")
         and j.assigned_tpu is not None
         and j.assigned_tpu.name in stolen_names
     )
@@ -307,9 +307,9 @@ class Scheduler:
                 else:  # allocate at queued job location
                     default_combo_pointer = 0  # reset default pointer
                     job = queued_jobs[0]
-                    if job.job_id != curr_job_id:
+                    if job.id != curr_job_id:
                         # new job, reset curr_combo
-                        curr_job_id = job.job_id
+                        curr_job_id = job.id
                         curr_combo.clear()
                         curr_combo_pointer = 0
                         for size in job.tpu_size:
@@ -385,7 +385,7 @@ class Scheduler:
         for tpu_name, mt in tpus.items():
             job = tpu_to_job.get(tpu_name)
             if job:
-                summary_lines.append(f"  {mt.tpu.name}: running job {job.job_id} ({job.run_name})")
+                summary_lines.append(f"  {mt.tpu.name}: running job {job.id} ({job.run_name})")
             else:
                 summary_lines.append(f"  {mt.tpu.name}: {mt.status}")
         
@@ -404,14 +404,14 @@ class Scheduler:
             tpu = job.assigned_tpu
             tracked_tpu = tpus.get(tpu.name)
             if tracked_tpu is None or tracked_tpu.status == "initializing":
-                jobs_to_clear.append(job.job_id)
+                jobs_to_clear.append(job.id)
                 continue
 
-            thread_log(f"Killing processes for cancelled job {job.job_id} on {tpu.name}...")
+            thread_log(f"Killing processes for cancelled job {job.id} on {tpu.name}...")
             if kill_remote_processes(tpu.name, tpu.zone, job.log_dir):
-                jobs_to_clear.append(job.job_id)
+                jobs_to_clear.append(job.id)
             else:
-                thread_log(f"Cleanup failed for cancelled job {job.job_id} on {tpu.name}; will retry.")
+                thread_log(f"Cleanup failed for cancelled job {job.id} on {tpu.name}; will retry.")
         if len(jobs_to_clear) == 0:
             return
 
@@ -460,7 +460,7 @@ class Scheduler:
             job = self._steal_job
             assert job is not None
             if job.status != "queued":
-                thread_log(f"Current steal target job {job.job_id} is no longer queued. Aborting steal.")
+                thread_log(f"Current steal target job {job.id} is no longer queued. Aborting steal.")
                 self._steal_target = None
                 return
             tpu, started_at = self._steal_target
@@ -473,7 +473,7 @@ class Scheduler:
                     thread_log(f"TPU {tpu.name} became busy ({int(elapsed)}s / {self.steal_wait}s). Aborting steal.", force_print=True)
                 self._steal_target = None
                 with self.file_state.transact():
-                    job = self.file_state._jobs[job.job_id]
+                    job = self.file_state._jobs[job.id]
                     job.assigned_tpu = None
                 return
             if elapsed < self.steal_wait:
@@ -482,7 +482,7 @@ class Scheduler:
                 
             # Wait complete; hand off to init workers
             with self.file_state.transact():
-                job = self.file_state._jobs[job.job_id]
+                job = self.file_state._jobs[job.id]
                 if job.status == "queued":
                     # Get worker count
                     _, _, _, n_workers = gcloud_describe_tpu(tpu.name, tpu.zone)
@@ -493,7 +493,7 @@ class Scheduler:
                     tpu.num_workers = n_workers
                     thread_log(f"Stealing TPU {tpu.name}. Queued for init.", force_print=True)
                     job.assigned_tpu = tpu
-                    job.status = "matched"
+                    job.status = "waiting"
                     self.file_state._tpus[tpu.name] = ManagedTPU(tpu=tpu, owned=False, status="need_init")
             self._steal_target = None
             self._steal_job = None
@@ -551,18 +551,18 @@ class Scheduler:
 
     def finalize_job(self, job: Job, returncode: int):
         fs = self.file_state
-        log_path = self.log_dir / f"job_{job.job_id}.log"
+        log_path = self.log_dir / f"job_{job.id}.log"
 
         with open(log_path, "a") as log_file, set_thread_vars(log_file=log_file):
             with fs.transact():
-                tracked_job = fs._jobs[job.job_id]
+                tracked_job = fs._jobs[job.id]
                 if tracked_job.status == "cancelled":
                     if tracked_job.assigned_tpu is not None:
                         mt = fs._tpus.get(tracked_job.assigned_tpu.name)
                         if mt is not None:
                             mt.status = "busy"  # let sync_state free it
                     tracked_job.assigned_tpu = None
-                    thread_log(f"[job {tracked_job.job_id}] cancelled, skipping retry", force_print=True)
+                    thread_log(f"[job {tracked_job.id}] cancelled, skipping retry", force_print=True)
                     return
 
                 tpu = tracked_job.assigned_tpu
@@ -586,18 +586,18 @@ class Scheduler:
             if returncode == EXIT_CODE_SSH_RETRY:
                 exists, state, health, _ = gcloud_describe_tpu(tpu.name, tpu.zone)
                 if (not exists) or state != "READY" or (health is not None and health != "HEALTHY"):
-                    thread_log(f"[job {job.job_id}] TPU {tpu.name} failed mid-task, removing it.", force_print=True)
+                    thread_log(f"[job {job.id}] TPU {tpu.name} failed mid-task, removing it.", force_print=True)
                     tpu_dead = True
 
             with fs.transact():
-                job = fs._jobs[job.job_id]
+                job = fs._jobs[job.id]
                 if job.status == "cancelled":
                     if job.assigned_tpu is not None:
                         mt = fs._tpus.get(job.assigned_tpu.name)
                         if mt is not None:
                             mt.status = "busy"
                     job.assigned_tpu = None
-                    thread_log(f"[job {job.job_id}] cancelled, skipping retry", force_print=True)
+                    thread_log(f"[job {job.id}] cancelled, skipping retry", force_print=True)
                     return
 
                 tpu = job.assigned_tpu
@@ -611,18 +611,18 @@ class Scheduler:
                 if returncode == 0:
                     job.status = "succeeded"
                     job.assigned_tpu = None
-                    thread_log(f"[job {job.job_id}] succeeded", force_print=True)
+                    thread_log(f"[job {job.id}] succeeded", force_print=True)
                 elif new_stage_dir is not None:
                     job.status = "queued"
                     job.assigned_tpu = None
                     job.attempt += 1
                     job.priority += 1
                     job.stage_dir = new_stage_dir
-                    thread_log(f"[job {job.job_id}] failed and re-queued (exit {returncode})", force_print=True)
+                    thread_log(f"[job {job.id}] failed and re-queued (exit {returncode})", force_print=True)
                 else:
                     job.status = "failed"
                     job.assigned_tpu = None
-                    thread_log(f"[job {job.job_id}] failed (exit {returncode})", force_print=True)
+                    thread_log(f"[job {job.id}] failed (exit {returncode})", force_print=True)
 
 
     def poll_jobs(self):
@@ -632,7 +632,7 @@ class Scheduler:
             if job.assigned_tpu is None or job.status != "running":
                 continue
             if job.assigned_tpu.num_workers is None:
-                thread_log(f"[job {job.job_id}] ERROR: TPU {job.assigned_tpu.name} has no num_workers.", force_print=True)
+                thread_log(f"[job {job.id}] ERROR: TPU {job.assigned_tpu.name} has no num_workers.", force_print=True)
                 continue
 
             returncode = poll_launch(job.log_dir, job.assigned_tpu.num_workers)
@@ -679,9 +679,9 @@ class Scheduler:
             excluded_tpus = set()  # TPUs that already have matched jobs
             to_launch: list[tuple[int, str]] = []  # (job_id, tpu_name) to launch this turn
 
-            # Check on jobs with "matched" status
+            # Check on jobs with "waiting" status
             for job in fs._jobs.values():
-                if job.status != "matched":
+                if job.status != "waiting":
                     continue
                 assert job.assigned_tpu is not None  # assigned_tpu is guaranteed to exist
                 tpu_name = job.assigned_tpu.name
@@ -691,7 +691,7 @@ class Scheduler:
                 else:
                     excluded_tpus.add(tpu_name)
                     if fs._tpus[tpu_name].status == "free":
-                        to_launch.append((job.job_id, tpu_name))
+                        to_launch.append((job.id, tpu_name))
             
             # Match queued jobs
             num_stolen_jobs = count_stolen_jobs(fs._jobs, fs._tpus)
@@ -709,7 +709,7 @@ class Scheduler:
                         num_stolen_jobs += 1
                 if match:
                     excluded_tpus.add(match)
-                    to_launch.append((job.job_id, match))
+                    to_launch.append((job.id, match))
                 elif first_unmatched is None:
                     first_unmatched = job
 
@@ -733,7 +733,7 @@ class Scheduler:
         ):
             if self._steal_job is None:
                 self._steal_job = first_unmatched
-            elif first_unmatched.job_id == self._steal_job.job_id:
+            elif first_unmatched.id == self._steal_job.id:
                 pass
             else:
                 self._steal_job = first_unmatched
