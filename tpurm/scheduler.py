@@ -27,9 +27,9 @@ from .common import (
     _thread_local, thread_log, set_thread_vars,
     zone_to_region, name_to_tpu, size_to_family,
     gcloud_delete_tpu, gcloud_describe_tpu, list_tpus,
-    check_datasets_mounts, check_env, check_vacancy,
+    check_vacancy,
 )
-from .state import FILE_STATE_DIR, FileState, Job, ManagedTPU
+from .state import FILE_STATE_DIR, Filestate, Job, ManagedTPU
 from .staging import (
     stage_code, launch, poll_launch, has_fatal_error_in_logs,
     kill_remote_processes, EXIT_CODE_FATAL, EXIT_CODE_SSH_RETRY,
@@ -37,6 +37,7 @@ from .staging import (
 from .steal import scan_target
 from .initialize import allocate, ensure_ready
 from .freeze import freeze
+from .util_ssh import check_setup
 
 
 
@@ -95,7 +96,7 @@ def count_stolen_jobs(jobs: dict[int, Job], tpus: dict[str, ManagedTPU]) -> int:
     )
 
 
-def sync_state(file_state: FileState, startup: bool=False):
+def sync_state(file_state: Filestate, startup: bool=False):
     # We first do a read, and only change the TPUs whose status remain the same
     read_status: dict[tuple[str, str], str] = {}  # key -> status
     # Keys for which to do all the checks
@@ -153,22 +154,21 @@ def sync_state(file_state: FileState, startup: bool=False):
             if state != "READY" or (health is not None and health != "HEALTHY"):
                 out["status"] = "busy"
                 return
-            out["datasets"] = check_datasets_mounts(tpu_name, zone, max_ssh_tries=1)
+            setup = check_setup(tpu_name, zone, max_ssh_tries=1)
+            if setup is not None:
+                out["datasets"] = setup["datasets"]
             vacant_ok = check_vacancy(tpu_name, zone, max_ssh_tries=1)
-            unknowns = int(out["datasets"] is None) + int(vacant_ok is None)
+            unknowns = int(setup is None) + int(vacant_ok is None)
             if vacant_ok is None:
                 out["status"] = "untrack" if unknowns >= 2 else "busy"
             elif not vacant_ok[0] or (key in keys_with_running_jobs):
                 out["status"] = "busy"
+            elif setup is None:
+                out["status"] = "untrack" if unknowns >= 2 else "busy"
+            elif setup["env"]:
+                out["status"] = "free"
             else:
-                env_ok = check_env(tpu_name, zone, max_ssh_tries=1)
-                unknowns += int(env_ok is None)
-                if env_ok is None:
-                    out["status"] = "untrack" if unknowns >= 2 else "busy"
-                elif env_ok:
-                    out["status"] = "free"
-                else:
-                    out["status"] = "need_init"
+                out["status"] = "need_init"
     
     parent_log_file = getattr(_thread_local, "log_file", None)
     def sync_one_with_context(key: tuple[str, str]) -> dict[str, Any]:
@@ -232,7 +232,7 @@ class Scheduler:
         self.tick_interval = tick_interval
         self.state_dir = state_dir
         self.log_dir = state_dir / "logs"
-        self.file_state = FileState(state_dir)
+        self.file_state = Filestate(state_dir)
 
         # Termination signal
         self._stop_file = Path(self.state_dir) / "tpurm.stop"

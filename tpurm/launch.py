@@ -1,8 +1,7 @@
 import dotenv
-from .common import (
-    TPU, DatasetName, DEFAULT_KEYS_DIR, REPO_ROOT, REMOTE_SCRIPTS_DIR, NFS_SSD_US,
-    gcloud_ssh, run_cmd, thread_log,
-)
+from .globals import DatasetName, DEFAULT_KEYS_DIR
+from .tpu import TPU
+from .util_ssh import gcloud_ssh
 
 dotenv.load_dotenv(Path.home() / ".env")
 WANDB_KEY = os.getenv("WANDB_KEY")
@@ -85,6 +84,7 @@ def launch(
     )
     result = gcloud_ssh(
         tpu.name, tpu.zone, remote_cmd, 
+        operation="launch",
         worker="all", 
         timeout=None, 
         capture_output=False, 
@@ -92,14 +92,14 @@ def launch(
     )
 
     # This is the return code of the gcloud call, not the remote command
-    if result.ssh_retry_exhausted:
+    if result.retry_exhausted:
         returncode = EXIT_CODE_SSH_RETRY
     else:
         returncode = result.returncode
     if returncode == EXIT_CODE_SSH_RETRY:
-        thread_log(f"Failed to launch job: exit code {returncode} (SSH retries exceeded).")
+        thread_log(f"Failed to launch job: exit code {returncode} (SSH retries exceeded). Logs: {result.log_dir}")
     elif returncode != 0:
-        thread_log(f"Failed to launch job: exit code {returncode}.")
+        thread_log(f"Failed to launch job: exit code {returncode}. Logs: {result.log_dir}")
     return returncode
 
 

@@ -7,7 +7,7 @@ from .common import thread_log, DatasetName
 from .scheduler import FILE_STATE_DIR, Scheduler
 from .steal import scan_target, get_zone_from_name
 from .staging import stage_code, kill_remote_processes
-from .state import FileState, Job
+from .state import Filestate, Job
 from .freeze import freeze
 
 
@@ -32,7 +32,7 @@ def submit_job(
     freeze()
     stage_dir = stage_code(run_name, project_name)
 
-    fs = FileState(state_dir)
+    fs = Filestate(state_dir)
     with fs.transact():
         job_id = fs._next_job_id
         fs._next_job_id += 1
@@ -57,7 +57,7 @@ def submit_job(
 
 
 def resume_job(job_id: int, state_dir: Path = FILE_STATE_DIR):
-    fs = FileState(state_dir)
+    fs = Filestate(state_dir)
     with fs.transact():
         if job_id not in fs._jobs:
             raise ValueError(f"Job {job_id} not found.")
@@ -70,7 +70,7 @@ def resume_job(job_id: int, state_dir: Path = FILE_STATE_DIR):
 
 
 def cancel_job(job_id: int, state_dir: Path = FILE_STATE_DIR):
-    fs = FileState(state_dir)
+    fs = Filestate(state_dir)
 
     with fs.transact():
         if job_id not in fs._jobs:

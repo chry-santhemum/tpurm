@@ -9,12 +9,14 @@ from dataclasses import dataclass, field, asdict
 from .common import TPU, DatasetName, REPO_ROOT
 from .staging import stage_dir_to_log_dir
 
+
 FILE_STATE_DIR = REPO_ROOT / ".tpurm"
 
 JobStatus = Literal["queued", "waiting", "running", "done"]
 # waiting: job has been matched to a TPU, but it needs initialization/warmup
 
 TPUStatus = Literal["need_init", "initializing", "free", "busy"]
+
 
 @dataclass
 class Job:
@@ -49,7 +51,7 @@ class ManagedTPU:
     datasets: list[DatasetName]=field(default_factory=list)  # datasets that TPU has mounted
 
 
-class FileState:
+class Filestate:
     """
     File-based state for communication between threads.
     """
@@ -112,12 +114,11 @@ class FileState:
 # helper for loading file state
 def _deserialize_maybe_tpu(d: Any):
     """If d is dumped from a TPU, reconstruct it."""
-    if isinstance(d, dict) and all(k in d for k in ["size", "mode", "owner", "id", "zone"]):
-        tpu = TPU(d["size"], d["mode"], d["owner"], d["id"], d["zone"])
+    if isinstance(d, dict) and all(k in d for k in ["size", "mode", "owner", "id", "zone", "num_workers"]):
+        tpu = TPU(
+            size=d["size"], mode=d["mode"], owner=d["owner"], id=d["id"], zone=d["zone"], num_workers=d["num_workers"]
+        )
         if d.get("name") and d["name"] != tpu.name:
             tpu.name = d["name"]
-        if "num_workers" in d:
-            tpu.num_workers = d["num_workers"]
         return tpu
-    else:
-        return d
+    return d

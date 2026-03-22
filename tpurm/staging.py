@@ -230,16 +230,17 @@ def kill_remote_processes(tpu_name: str, zone: str, log_dir: str) -> bool:
         tpu_name,
         zone,
         cmd,
+        operation="kill_remote_processes",
         worker="all",
         timeout=60,
         capture_output=False,
         max_ssh_tries=2,
     )
     if not result.ok:
-        if result.ssh_retry_exhausted:
-            thread_log(f"Failed to kill remote processes on {tpu_name}: SSH retries exhausted (TPU likely preempted)")
+        if result.retry_exhausted:
+            thread_log(f"Failed to kill remote processes on {tpu_name}: SSH retries exhausted (TPU likely preempted). Logs: {result.log_dir}")
             return True
         else:
-            thread_log(f"Failed to kill remote processes on {tpu_name}: exit code {result.returncode}")
+            thread_log(f"Failed to kill remote processes on {tpu_name}: exit code {result.returncode}. Logs: {result.log_dir}")
             return False
     return True

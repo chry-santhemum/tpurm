@@ -4,11 +4,12 @@ import threading
 
 from .common import (
     TPU, AllocMode, REPO_ROOT,
-    thread_log, check_env, check_requirements,
+    thread_log,
     gcloud_create_tpu, gcloud_describe_tpu,
     run_remote_script,
 )
 from . import wheelhouse
+from .util_ssh import check_setup
 
 ALLOCATION_MODES: dict[AllocMode, dict[str, str]] = {
     "spot": {
@@ -123,11 +124,11 @@ def init_and_install(
             return False
         thread_log(f"Initialization attempt {attempt}/{max_attempts}")
 
-        base_env_ok = check_env(tpu.name, tpu.zone)
-        if base_env_ok is None:
-            thread_log("Warning: Base environment check failed over SSH. Retrying...")
+        setup = check_setup(tpu.name, tpu.zone, requirements_hash=req_hash)
+        if setup is None:
+            thread_log("Warning: Setup check failed over SSH. Retrying...")
             continue
-        if not base_env_ok:
+        if not setup["env"]:
             init_env = {"SKIP_UPGRADE": "1"} if skip_upgrade else {"SKIP_UPGRADE": "0"}
             if not run_remote_script(tpu.name, tpu.zone, "init.sh", env=init_env, max_ssh_tries=3):
                 thread_log("init.sh failed. Retrying in 15s.")
@@ -135,22 +136,19 @@ def init_and_install(
                 continue
             thread_log(f"Waiting {settle_time}s for environment to settle...")
             time.sleep(settle_time)
-            base_env_ok = check_env(tpu.name, tpu.zone)
-            if base_env_ok is not True:
-                thread_log("Warning: Base environment check failed after init. Retrying...")
+            setup = check_setup(tpu.name, tpu.zone, requirements_hash=req_hash)
+            if setup is None or not setup["env"]:
+                thread_log("Warning: Setup check failed after init. Retrying...")
                 continue
 
-        requirements_ok = check_requirements(tpu.name, tpu.zone, req_hash)
-        if requirements_ok is None:
-            thread_log("Warning: Requirements check failed over SSH. Retrying...")
-            continue
-        if not requirements_ok:
+        if not setup["requirements"]:
             if not _install_requirements(tpu, requirements_lock, req_hash):
                 thread_log("install.sh failed. Retrying in 30s.")
                 time.sleep(30)
                 continue
-            if not check_requirements(tpu.name, tpu.zone, req_hash):
-                thread_log("Warning: Requirements check failed after install. Retrying...")
+            setup = check_setup(tpu.name, tpu.zone, requirements_hash=req_hash)
+            if setup is None or not setup["requirements"]:
+                thread_log("Warning: Setup check failed after install. Retrying...")
                 continue
         thread_log("Initialization successful.")
         return True
@@ -163,7 +161,8 @@ def ensure_ready(tpu: TPU, skip_upgrade: bool = False) -> bool:
     """Ensure TPU has correct environment. Returns True when ready."""
     requirements_lock = str(REPO_ROOT / "requirements.lock")
     req_hash = wheelhouse.requirements_hash(requirements_lock)
-    if check_env(tpu.name, tpu.zone) is not True or check_requirements(tpu.name, tpu.zone, req_hash) is not True:
+    setup = check_setup(tpu.name, tpu.zone, requirements_hash=req_hash)
+    if setup is None or not setup["env"] or not setup["requirements"]:
         thread_log(f"Initializing {tpu.name}...")
         if not init_and_install(
             tpu,

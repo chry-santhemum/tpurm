@@ -42,7 +42,14 @@ def tarball_exists(tpu: TPU, requirements_hash: str) -> bool:
     env = _env_string(tpu, requirements_hash=requirements_hash)
     preamble = compose_remote_script("gcloud_auth.sh", "wheelhouse_preamble.sh")
     full_cmd = f"{env} bash -s <<'REMOTE'\n{preamble}\ngcloud storage ls {shlex.quote(uri)} >/dev/null 2>&1\nREMOTE"
-    result = gcloud_ssh(tpu.name, tpu.zone, full_cmd, worker="0", timeout=60, capture_output=False, max_ssh_tries=3)
+    result = gcloud_ssh(
+        tpu.name, tpu.zone, full_cmd,
+        operation="wheelhouse_exists",
+        worker="0",
+        timeout=60,
+        capture_output=False,
+        max_ssh_tries=3,
+    )
     return result.ok
 
 
@@ -58,9 +65,16 @@ def build(tpu: TPU, requirements_lock: str, wheelhouse_dir: str="") -> bool:
     preamble = compose_remote_script("gcloud_auth.sh", "wheelhouse_preamble.sh")
     body = read_remote_script("wheelhouse_build.sh")
     full_cmd = f"{env} bash -s <<'REMOTE'\n" + preamble + '\n' + body + "\nREMOTE"
-    result = gcloud_ssh(tpu.name, tpu.zone, full_cmd, worker="0", timeout=None, capture_output=False, max_ssh_tries=3)
-    if result.ssh_retry_exhausted:
-        thread_log(f"Wheelhouse build SSH retries exhausted on {tpu.name} (TPU likely preempted)")
+    result = gcloud_ssh(
+        tpu.name, tpu.zone, full_cmd,
+        operation="wheelhouse_build",
+        worker="0",
+        timeout=None,
+        capture_output=False,
+        max_ssh_tries=3,
+    )
+    if result.retry_exhausted:
+        thread_log(f"Wheelhouse build SSH retries exhausted on {tpu.name} (TPU likely preempted). Logs: {result.log_dir}")
     return result.ok
 
 
@@ -72,7 +86,14 @@ def install(tpu: TPU, requirements_lock: str, wheelhouse_dir: str="") -> bool:
     preamble = compose_remote_script("gcloud_auth.sh", "wheelhouse_preamble.sh")
     body = read_remote_script("wheelhouse_install.sh")
     full_cmd = f"{env} bash -s <<'REMOTE'\n" + preamble + '\n' + body + "\nREMOTE"
-    result = gcloud_ssh(tpu.name, tpu.zone, full_cmd, worker="all", timeout=None, capture_output=False, max_ssh_tries=3)
-    if result.ssh_retry_exhausted:
-        thread_log(f"Wheelhouse install SSH retries exhausted on {tpu.name} (TPU likely preempted)")
+    result = gcloud_ssh(
+        tpu.name, tpu.zone, full_cmd,
+        operation="wheelhouse_install",
+        worker="all",
+        timeout=None,
+        capture_output=False,
+        max_ssh_tries=3,
+    )
+    if result.retry_exhausted:
+        thread_log(f"Wheelhouse install SSH retries exhausted on {tpu.name} (TPU likely preempted). Logs: {result.log_dir}")
     return result.ok
