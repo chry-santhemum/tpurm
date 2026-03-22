@@ -1,14 +1,16 @@
 import argparse
 import time
 from pathlib import Path
-from typing import Optional, get_args
+from typing import get_args
 
-from .common import thread_log, DatasetName
-from .scheduler import FILE_STATE_DIR, Scheduler
-from .steal import scan_target
-from .staging import stage_code, kill_remote_processes
-from .state import Filestate, Job
 from .freeze import freeze
+from .globals import DatasetName
+from .filestate import FILE_STATE_DIR, Filestate, Job
+from .scheduler import Scheduler
+from .steal import scan_target
+from .staging import stage_code
+from .util_log import LogContext
+from .util_ssh import kill_remote_processes
 
 
 def submit_job(
@@ -16,11 +18,13 @@ def submit_job(
     region: list[str]|None,
     run_name: str,
     project_name: str,
-    command: Optional[str],
-    command_path: Optional[str],
+    command: str | None,
+    command_path: str | None,
     datasets: list[DatasetName],
     priority: int,
     max_att: int,
+    *,
+    log_ctx: LogContext,
     state_dir: Path = FILE_STATE_DIR,
 ) -> int:
     """Appends new jobs in queued state."""
@@ -30,14 +34,14 @@ def submit_job(
     if command.startswith("python "):
         raise ValueError("Use python3.13 instead of python.")
     freeze()
-    stage_dir = stage_code(run_name, project_name)
+    stage_dir = stage_code(run_name, project_name, log_ctx=log_ctx)
+    stored_max_att = None if max_att <= 0 else max_att
 
     fs = Filestate(state_dir)
     with fs.transact():
-        job_id = fs._next_job_id
-        fs._next_job_id += 1
-        fs._jobs[job_id] = Job(
-            job_id=job_id,
+        job_id = len(fs._jobs)
+        fs._jobs.append(Job(
+            id=job_id,
             created_at=time.time(),
             command=command,
             tpu_size=tpu_size,
@@ -47,45 +51,45 @@ def submit_job(
             project_name=project_name,
             stage_dir=stage_dir,
             attempt=1,
-            max_att=max_att,
+            max_att=stored_max_att,
             priority=priority,
             assigned_tpu=None,
             status="queued",
-        )
-    thread_log(f"Submitted job {job_id}: run_name={run_name}")
+        ))
+    log_ctx.log(f"Submitted job {job_id}: run_name={run_name}")
     return job_id
 
 
-def resume_job(job_id: int, state_dir: Path = FILE_STATE_DIR):
+def resume_job(job_id: int, *, log_ctx: LogContext, state_dir: Path = FILE_STATE_DIR):
     fs = Filestate(state_dir)
     with fs.transact():
-        if job_id not in fs._jobs:
+        if not (0 <= job_id < len(fs._jobs)):
             raise ValueError(f"Job {job_id} not found.")
         job = fs._jobs[job_id]
         job.status = "queued"
         job.attempt = 1
         if job.assigned_tpu is not None:
             job.region = [job.assigned_tpu.region]
-    thread_log(f"Resumed job {job_id} at region {job.region}")
+    log_ctx.log(f"Resumed job {job_id} at region {job.region}")
 
 
-def cancel_job(job_id: int, state_dir: Path = FILE_STATE_DIR):
+def cancel_job(job_id: int, *, log_ctx: LogContext, state_dir: Path = FILE_STATE_DIR):
     fs = Filestate(state_dir)
 
     with fs.transact():
-        if job_id not in fs._jobs:
-            thread_log(f"Error: Job {job_id} not found.")
+        if not (0 <= job_id < len(fs._jobs)):
+            log_ctx.log(f"Error: Job {job_id} not found.")
             return
         job = fs._jobs[job_id]
         if job.status == "queued":
             job.assigned_tpu = None
-            job.status = "cancelled"
-            thread_log(f"Cancelled queued job {job_id}")
-        elif job.status in ("waiting", "running"): 
-            thread_log(f"Marked {job.status} job {job_id} as cancelled.")
-            job.status = "cancelled"
+            job.status = "done"
+            log_ctx.log(f"Cancelled queued job {job_id}")
+        elif job.status in ("waiting", "running"):
+            log_ctx.log(f"Cancelled {job.status} job {job_id}.")
+            job.status = "done"
         else:
-            thread_log(f"Error: Job {job_id} is already {job.status}.")
+            log_ctx.log(f"Error: Job {job_id} is already {job.status}.")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -114,7 +118,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # kill
     sub = subparsers.add_parser("kill", help="Kill remote TPU processes by TPU name")
-    sub.add_argument("tpu_name", type=str, required=True)
+    sub.add_argument("tpu_name", type=str)
     sub.add_argument("--zone", type=str, required=True)
     
     # freeze
@@ -139,6 +143,7 @@ def main(argv: list[str] | None = None) -> int:
     subparsers.add_parser("stop", help="Gracefully stop the daemon")
 
     args = parser.parse_args(argv)
+    log_ctx = LogContext(None)
 
     if args.action == "submit":
         if (args.command is None) == (args.command_path is None):
@@ -154,16 +159,22 @@ def main(argv: list[str] | None = None) -> int:
             datasets=args.dataset,
             priority=args.priority,
             max_att=args.max_att,
+            log_ctx=log_ctx,
         )
     elif args.action == "resume":
-        resume_job(args.id)
+        resume_job(args.job_id, log_ctx=log_ctx)
     elif args.action == "cancel":
-        cancel_job(args.id)
+        cancel_job(args.job_id, log_ctx=log_ctx)
     elif args.action == "kill":
-        return 0 if kill_remote_processes(args.tpu_name, args.zone, "/tmp/tpurm-kill-all-no-log-dir") else 1
+        return 0 if kill_remote_processes(
+            args.tpu_name,
+            args.zone,
+            "/tmp/tpurm-kill-all-no-log-dir",
+            log_ctx=log_ctx,
+        ) else 1
     elif args.action == "scan":
-        vacant = scan_target(args.tpu_size, args.region)
-        thread_log(f"\n{len(vacant)} vacant TPU(s) found.", force_print=True)
+        vacant = scan_target(args.tpu_size, args.region, log_ctx=log_ctx)
+        log_ctx.log(f"{len(vacant)} vacant TPU(s) found.")
     elif args.action == "freeze":
         freeze()
     elif args.action == "start":
@@ -179,9 +190,10 @@ def main(argv: list[str] | None = None) -> int:
         scheduler.run()
 
     elif args.action == "stop":
+        FILE_STATE_DIR.mkdir(parents=True, exist_ok=True)
         stop_file = FILE_STATE_DIR / "tpurm.stop"
         stop_file.touch()
-        thread_log(f"Stop file created: {stop_file}", force_print=True)
+        log_ctx.log(f"Stop file created: {stop_file}")
     else:
         parser.print_help()
         return 2

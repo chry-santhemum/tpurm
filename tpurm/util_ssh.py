@@ -120,6 +120,39 @@ def gcloud_ssh(
         return finish(-1)
 
 
+def kill_remote_processes(
+    tpu_name: str,
+    zone: str,
+    log_dir: str,
+    *,
+    log_ctx: LogContext,
+    timeout: float = 60,
+    max_ssh_tries: int = 2,
+) -> bool:
+    remote_cmd = textwrap.dedent(
+        f"""\
+        LOG_DIR={shlex.quote(log_dir)} bash -s <<'REMOTE_SCRIPT'
+        {read_remote_script("kill.sh")}
+        REMOTE_SCRIPT
+        """
+    )
+    result = gcloud_ssh(
+        tpu_name,
+        zone,
+        remote_cmd,
+        operation="kill_remote_processes",
+        worker="all",
+        timeout=timeout,
+        max_ssh_tries=max_ssh_tries,
+        capture_output=False,
+        log_ctx=log_ctx,
+    )
+    if result.ok or result.retry_exhausted:
+        return True
+    log_ctx.log(f"Failed to kill remote processes on {tpu_name}: exit code {result.returncode}. Logs: {result.log_dir}")
+    return False
+
+
 # Helpers for checking if a TPU is ready to launch jobs
 
 _SETUP_MARKER = "__TPURM_SETUP__"

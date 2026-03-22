@@ -56,8 +56,8 @@ class Filestate:
     _jobs: list[Job]  # indexed by job.id
     _tpus: dict[str, ManagedTPU]  # tpu_name -> ManagedTPU
 
-    def __init__(self, state_dir: str):
-        self.state_dir = Path(state_dir)
+    def __init__(self, state_dir: Path):
+        self.state_dir = state_dir
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self._file_path = self.state_dir / "state.json"
         self._lock_path = self.state_dir / "state.lock"
