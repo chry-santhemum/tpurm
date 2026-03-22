@@ -13,7 +13,7 @@ from .staging import stage_dir_to_log_dir
 
 FILE_STATE_DIR = REPO_ROOT / ".tpurm"
 
-JobStatus = Literal["queued", "waiting", "running", "done"] 
+JobStatus = Literal["queued", "waiting", "running", "done", "cancelled"] 
 # waiting: job has been matched to a TPU, but it needs initialization/warmup
 
 TPUStatus = Literal["need_init", "initializing", "free", "busy"]
@@ -40,7 +40,7 @@ class Job:
     status: JobStatus
 
     def __post_init__(self):
-        self.log_dir = stage_dir_to_log_dir(self.stage_dir)
+        self.log_dir = stage_dir_to_log_dir(self.stage_dir, attempt=self.attempt)
 
 @dataclass
 class ManagedTPU:

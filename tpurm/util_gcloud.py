@@ -72,3 +72,14 @@ def gcloud_describe(
 
     log_ctx.log(f"TPU info: {info}")
     return info
+
+def gcloud_storage_ls(path: str, *, log_ctx: LogContext) -> list[str]:
+    cmd = ["gcloud", "storage", "ls", path]
+    log_ctx.log(f"$ {shlex.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if stderr:
+            log_ctx.log(f"Warning: gcloud storage ls failed for {path}: {stderr}")
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]

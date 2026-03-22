@@ -17,6 +17,7 @@ def launch(
     project_name: str,
     stage_dir: str,
     datasets: list[DatasetName] | None = None,
+    log_dir: str | None = None,
     *,
     log_ctx: LogContext,
 ) -> int:
@@ -27,7 +28,8 @@ def launch(
     which will be replaced with the corresponding arguments.
     """
     stage_dir_suffix = stage_dir.split("/staging/")[-1]
-    log_dir = stage_dir_to_log_dir(stage_dir)
+    if log_dir is None:
+        log_dir = stage_dir_to_log_dir(stage_dir)
     os.makedirs(log_dir, exist_ok=True)
     os.chmod(log_dir, 0o777)
 

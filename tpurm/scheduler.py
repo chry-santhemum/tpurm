@@ -21,8 +21,9 @@ from .filestate import FILE_STATE_DIR, Filestate, Job, ManagedTPU
 from .steal import scan_target
 from .initialize import allocate, ensure_ready
 from .launch import launch, poll_launch, has_fatal_error_in_logs, EXIT_CODE_FATAL, EXIT_CODE_SSH_RETRY
+from .staging import stage_dir_to_log_dir
 from .tpu import TPU, TPU_CONFIGS, zone_to_region, name_to_tpu, size_to_family
-from .util_gcloud import gcloud_delete, gcloud_describe, gcloud_list
+from .util_gcloud import gcloud_delete, gcloud_describe, gcloud_list, gcloud_storage_ls
 from .util_log import LogContext
 from .util_ssh import check_setup, check_vacancy, kill_remote_processes
 
@@ -81,6 +82,22 @@ def count_stolen_jobs(jobs: list[Job], tpus: dict[str, ManagedTPU]) -> int:
         and j.assigned_tpu is not None
         and j.assigned_tpu.name in stolen_names
     )
+
+def allocation_combos(tpu_sizes: list[str], regions: list[str] | None) -> list[tuple[str, str]]:
+    combos = []
+    for size in tpu_sizes:
+        allowed_zones = TPU_CONFIGS[size_to_family(size)]["allowed_zones"]
+        if regions is not None:
+            allowed_zones = [zone for zone in allowed_zones if zone_to_region(zone) in regions]
+        combos.extend((size, zone) for zone in allowed_zones)
+    return combos
+
+def checkpoint_glob(job: Job, tpu: TPU) -> str:
+    return f"{tpu.bucket}/atticusw/checkpoints/{job.project_name}/{job.run_name}/*"
+
+def has_checkpoint(job: Job, tpu: TPU, *, log_ctx: LogContext) -> bool:
+    paths = gcloud_storage_ls(checkpoint_glob(job, tpu), log_ctx=log_ctx)
+    return len(paths) > 0
 
 
 def sync_state(file_state: Filestate, *, log_ctx: LogContext, startup: bool=False):
@@ -221,6 +238,8 @@ class Scheduler:
         self.state_dir = state_dir
         self.log_dir = state_dir / "logs"
         self.file_state = Filestate(state_dir)
+        if self.alloc_max > 0 and self.alloc_workers > 0 and len(allocation_combos(self.alloc_sizes, self.alloc_regions)) == 0:
+            raise ValueError("No valid allocation size/region combination is possible")
 
         # Termination signal
         self._stop_file = Path(self.state_dir) / "tpurm.stop"
@@ -269,12 +288,7 @@ class Scheduler:
         
     def alloc_worker(self, worker_id: int):
         log_path = self.log_dir / f"alloc_worker_{worker_id}.log"
-        default_combo = []
-        for size in self.alloc_sizes:
-            allowed_zones = TPU_CONFIGS[size_to_family(size)]["allowed_zones"]
-            if self.alloc_regions is not None:
-                allowed_zones = [z for z in allowed_zones if zone_to_region(z) in self.alloc_regions]
-            default_combo.extend([(size, zone) for zone in allowed_zones])
+        default_combo = allocation_combos(self.alloc_sizes, self.alloc_regions)
         default_combo_pointer = 0
 
         curr_combo = []
@@ -296,24 +310,34 @@ class Scheduler:
                 queued_jobs.sort(key=lambda j: (-j.priority, j.created_at))
                 if len(queued_jobs) == 0:
                     if len(default_combo) == 0:
-                        raise ValueError("No tpu_size/region combination is possible")
+                        log_ctx.log(f"[worker {worker_id}] No valid default allocation combination; sleeping.")
+                        self._stop_event.wait(30)
+                        continue
                     size, zone = default_combo[default_combo_pointer]
                     default_combo_pointer = (default_combo_pointer + 1) % len(default_combo)
                 else:  # allocate at queued job location
                     default_combo_pointer = 0  # reset default pointer
-                    job = queued_jobs[0]
-                    if job.id != curr_job_id:
-                        # new job, reset curr_combo
-                        curr_job_id = job.id
+                    chosen = None
+                    for job in queued_jobs:
+                        if job.id != curr_job_id:
+                            curr_combo = allocation_combos(job.tpu_size, job.region)
+                            curr_job_id = job.id
+                            curr_combo_pointer = 0
+                        if len(curr_combo) == 0:
+                            log_ctx.log(f"[worker {worker_id}] Job {job.id} has no valid allocation combination; skipping it.")
+                            continue
+                        size, zone = curr_combo[curr_combo_pointer]
+                        curr_combo_pointer = (curr_combo_pointer + 1) % len(curr_combo)
+                        chosen = (size, zone)
+                        break
+                    if chosen is None:
+                        curr_job_id = None
                         curr_combo.clear()
                         curr_combo_pointer = 0
-                        for size in job.tpu_size:
-                            allowed_zones = TPU_CONFIGS[size_to_family(size)]["allowed_zones"]
-                            if job.region is not None:
-                                allowed_zones = [z for z in allowed_zones if zone_to_region(z) in job.region]
-                            curr_combo.extend([(size, zone) for zone in allowed_zones])
-                    size, zone = curr_combo[curr_combo_pointer]
-                    curr_combo_pointer = (curr_combo_pointer + 1) % len(curr_combo)
+                        log_ctx.log(f"[worker {worker_id}] No queued job has a valid allocation combination; sleeping.")
+                        self._stop_event.wait(30)
+                        continue
+                    size, zone = chosen
                     
                 self.try_alloc(worker_id, size, zone, log_ctx=log_ctx)
 
@@ -328,8 +352,11 @@ class Scheduler:
                 self.file_state._tpus[tpu.name] = ManagedTPU(tpu=tpu, owned=mt.owned, status="free")
             return True
 
-        log_ctx.log(f"[worker {worker_id}] Initialization failed. Deleting: {tpu.name}", force_print=True)
-        gcloud_delete(tpu.name, tpu.zone, log_ctx=log_ctx)
+        if mt.owned:
+            log_ctx.log(f"[worker {worker_id}] Initialization failed. Deleting: {tpu.name}", force_print=True)
+            gcloud_delete(tpu.name, tpu.zone, log_ctx=log_ctx)
+        else:
+            log_ctx.log(f"[worker {worker_id}] Initialization failed. Untracking stolen TPU: {tpu.name}", force_print=True)
         with self.file_state.transact():
             self.file_state._tpus.pop(tpu.name, None)
         return False
@@ -545,6 +572,7 @@ class Scheduler:
                 mt.tpu, job.command, stage_dir=job.stage_dir,
                 run_name=job.run_name, project_name=job.project_name,
                 datasets=job.datasets,
+                log_dir=job.log_dir,
                 log_ctx=log_ctx,
             )
             if returncode != 0:  # Job failed to start
@@ -572,12 +600,16 @@ class Scheduler:
                 assert tpu is not None
                 attempt = tracked_job.attempt
                 max_att = tracked_job.max_att
+                retry_region = copy.deepcopy(tracked_job.region)
 
             might_retry = (
                 (max_att is None or attempt < max_att)
                 and returncode != 0
                 and returncode != EXIT_CODE_FATAL
             )
+            if might_retry and has_checkpoint(tracked_job, tpu, log_ctx=log_ctx):
+                retry_region = [tpu.region]
+                log_ctx.log(f"[job {job.id}] checkpoint found, pinning retry to region {tpu.region}")
 
             tpu_dead = False
             if returncode == EXIT_CODE_SSH_RETRY:
@@ -615,6 +647,8 @@ class Scheduler:
                     job.status = "queued"
                     job.assigned_tpu = None
                     job.attempt += 1
+                    job.region = retry_region
+                    job.log_dir = stage_dir_to_log_dir(job.stage_dir, attempt=job.attempt)
                     log_ctx.log(f"[job {job.id}] failed and re-queued (exit {returncode})", force_print=True)
                 else:
                     job.status = "done"

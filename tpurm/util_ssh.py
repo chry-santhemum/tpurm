@@ -129,6 +129,7 @@ def kill_remote_processes(
     timeout: float = 60,
     max_ssh_tries: int = 2,
 ) -> bool:
+    log_ctx.log(f"Killing REMOTE processes on {tpu_name}...")
     remote_cmd = textwrap.dedent(
         f"""\
         LOG_DIR={shlex.quote(log_dir)} bash -s <<'REMOTE_SCRIPT'
@@ -147,7 +148,13 @@ def kill_remote_processes(
         capture_output=False,
         log_ctx=log_ctx,
     )
-    if result.ok or result.retry_exhausted:
+    if result.ok:
+        return True
+    if result.retry_exhausted:
+        log_ctx.log(
+            f"Failed to kill remote processes on {tpu_name}: "
+            f"SSH retries exhausted (TPU likely preempted). Logs: {result.log_dir}"
+        )
         return True
     log_ctx.log(f"Failed to kill remote processes on {tpu_name}: exit code {result.returncode}. Logs: {result.log_dir}")
     return False

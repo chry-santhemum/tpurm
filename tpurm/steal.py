@@ -75,12 +75,12 @@ def scan_target(tpu_sizes: list[str], regions: list[str], *, log_ctx: LogContext
         info = results[(name, zone)]
         if info is None:
             status_str = "Dead"
-        elif info[0]:
+            continue
+        if info[0]:
             status_str = "Yes"
+            vacant_vms.append((name, zone))
         else:
             status_str = "No"
         log_ctx.log(f"{name:<55} {zone:<20} {status_str:<10} {info[1]}")
-        if info is not None and info[0]:
-            vacant_vms.append((name, zone))
     
     return vacant_vms

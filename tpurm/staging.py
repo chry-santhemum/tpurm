@@ -11,9 +11,12 @@ from .util_log import run_cmd, LogContext
 
 RETENTION_DAYS = 7
 
-def stage_dir_to_log_dir(stage_dir: str, *, root: str = NFS_SSD_US) -> str:
+def stage_dir_to_log_dir(stage_dir: str, *, root: str = NFS_SSD_US, attempt: int = 1) -> str:
     stage_dir_suffix = stage_dir.split("/staging/")[-1]
-    return str(Path(root) / "logs" / stage_dir_suffix)
+    log_dir = Path(root) / "logs" / stage_dir_suffix
+    if attempt > 1:
+        log_dir = log_dir / f"attempt_{attempt}"
+    return str(log_dir)
 
 def is_git_managed(path: Path) -> bool:
     """Checks if `path` is inside a git work tree."""
@@ -138,99 +141,3 @@ def stage_code(run_name: str, project_name: str, *, log_ctx: LogContext, retain=
     log_ctx.log("Done cleaning up.")
 
     return stage_dir
-
-
-# TODO: Replace with kill.sh
-# def kill_remote_processes(tpu_name: str, zone: str, log_dir: str) -> bool:
-#     """Kill the TPURM-managed runner process group for one job."""
-#     thread_log(f"Killing REMOTE processes on {tpu_name}...")
-#     cmd = textwrap.dedent(
-#         f"""\
-#         set -euo pipefail
-#         WORKER_ID=${{TPU_WORKER_ID:-$(hostname)}}
-#         PID_FILE={shlex.quote(log_dir)}/pid_${{WORKER_ID}}.txt
-#         cleanup_tpu_runtime() {{
-#           holder_pids="$(sudo lsof -t -w /dev/accel* /dev/vfio/* 2>/dev/null | sort -u || true)"
-#           if [ -n "$holder_pids" ]; then
-#             sudo kill -TERM $holder_pids >/dev/null 2>&1 || true
-#             for i in $(seq 1 5); do
-#               holder_pids="$(sudo lsof -t -w /dev/accel* /dev/vfio/* 2>/dev/null | sort -u || true)"
-#               if [ -z "$holder_pids" ]; then
-#                 break
-#               fi
-#               sleep 1
-#             done
-#             if [ -n "$holder_pids" ]; then
-#               sudo kill -KILL $holder_pids >/dev/null 2>&1 || true
-#               for i in $(seq 1 5); do
-#                 holder_pids="$(sudo lsof -t -w /dev/accel* /dev/vfio/* 2>/dev/null | sort -u || true)"
-#                 if [ -z "$holder_pids" ]; then
-#                   break
-#                 fi
-#                 sleep 1
-#               done
-#             fi
-#           fi
-#           holder_pids="$(sudo lsof -t -w /dev/accel* /dev/vfio/* 2>/dev/null | sort -u || true)"
-#           if [ -n "$holder_pids" ]; then
-#             return 1
-#           fi
-#           if [ -e /tmp/libtpu_lockfile ]; then
-#             sudo rm -f /tmp/libtpu_lockfile
-#           fi
-#         }}
-#         if [ ! -f "$PID_FILE" ]; then
-#           cleanup_tpu_runtime
-#           exit 0
-#         fi
-
-#         pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-#         case "$pid" in
-#           ''|*[!0-9]*)
-#             rm -f "$PID_FILE"
-#             cleanup_tpu_runtime
-#             exit 0
-#             ;;
-#         esac
-
-#         sudo kill -TERM -- "-$pid" >/dev/null 2>&1 || true
-#         for i in $(seq 1 10); do
-#           if ! sudo kill -0 -- "-$pid" >/dev/null 2>&1; then
-#             rm -f "$PID_FILE"
-#             cleanup_tpu_runtime
-#             exit 0
-#           fi
-#           sleep 1
-#         done
-
-#         sudo kill -KILL -- "-$pid" >/dev/null 2>&1 || true
-#         for i in $(seq 1 5); do
-#           if ! sudo kill -0 -- "-$pid" >/dev/null 2>&1; then
-#             rm -f "$PID_FILE"
-#             cleanup_tpu_runtime
-#             exit 0
-#           fi
-#           sleep 1
-#         done
-
-#         exit 1
-#         """
-#     )
-#     result = gcloud_ssh(
-#         tpu_name,
-#         zone,
-#         cmd,
-#         operation="kill_remote_processes",
-#         worker="all",
-#         timeout=60,
-#         capture_output=False,
-#         max_ssh_tries=2,
-#     )
-#     if not result.ok:
-#         if result.retry_exhausted:
-#             thread_log(f"Failed to kill remote processes on {tpu_name}: SSH retries exhausted (TPU likely preempted). Logs: {result.log_dir}")
-#             return True
-#         else:
-#             thread_log(f"Failed to kill remote processes on {tpu_name}: exit code {result.returncode}. Logs: {result.log_dir}")
-#             return False
-#     return True

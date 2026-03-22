@@ -6,9 +6,9 @@ from typing import get_args
 from .freeze import freeze
 from .globals import DatasetName
 from .filestate import FILE_STATE_DIR, Filestate, Job
-from .scheduler import Scheduler
+from .scheduler import Scheduler, allocation_combos
+from .staging import stage_code, stage_dir_to_log_dir
 from .steal import scan_target
-from .staging import stage_code
 from .util_log import LogContext
 from .util_ssh import kill_remote_processes
 
@@ -33,6 +33,8 @@ def submit_job(
         command = Path(command_path).read_text().strip()  # type: ignore
     if command.startswith("python "):
         raise ValueError("Use python3.13 instead of python.")
+    if len(allocation_combos(tpu_size, region)) == 0:
+        raise ValueError("No valid TPU size/region combination is possible for this job request.")
     freeze()
     stage_dir = stage_code(run_name, project_name, log_ctx=log_ctx)
     stored_max_att = None if max_att <= 0 else max_att
@@ -68,6 +70,7 @@ def resume_job(job_id: int, *, log_ctx: LogContext, state_dir: Path = FILE_STATE
         job = fs._jobs[job_id]
         job.status = "queued"
         job.attempt = 1
+        job.log_dir = stage_dir_to_log_dir(job.stage_dir, attempt=job.attempt)
         if job.assigned_tpu is not None:
             job.region = [job.assigned_tpu.region]
     log_ctx.log(f"Resumed job {job_id} at region {job.region}")
@@ -83,11 +86,11 @@ def cancel_job(job_id: int, *, log_ctx: LogContext, state_dir: Path = FILE_STATE
         job = fs._jobs[job_id]
         if job.status == "queued":
             job.assigned_tpu = None
-            job.status = "done"
+            job.status = "cancelled"
             log_ctx.log(f"Cancelled queued job {job_id}")
         elif job.status in ("waiting", "running"):
             log_ctx.log(f"Cancelled {job.status} job {job_id}.")
-            job.status = "done"
+            job.status = "cancelled"
         else:
             log_ctx.log(f"Error: Job {job_id} is already {job.status}.")
 
@@ -148,6 +151,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.action == "submit":
         if (args.command is None) == (args.command_path is None):
             parser.error("Provide exactly one of --command or --command-path")
+        if len(allocation_combos(args.tpu_size, args.region)) == 0:
+            parser.error("No valid TPU size/region combination is possible for this job request.")
         run_name = time.strftime("%y%m%d%H%M%S") + "-" + args.run_name
         submit_job(
             tpu_size=args.tpu_size,
@@ -178,6 +183,8 @@ def main(argv: list[str] | None = None) -> int:
     elif args.action == "freeze":
         freeze()
     elif args.action == "start":
+        if args.alloc_max > 0 and args.alloc_workers > 0 and len(allocation_combos(args.alloc_sizes, args.alloc_regions)) == 0:
+            parser.error("No valid allocation size/region combination is possible.")
         scheduler = Scheduler(
             alloc_max=args.alloc_max,
             alloc_sizes=args.alloc_sizes,

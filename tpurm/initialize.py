@@ -114,13 +114,13 @@ def allocate(
             mode_flag=mode_cfg["direct_flag"],
             log_ctx=log_ctx,
         )
+        time.sleep(15)
         if result.returncode != 0:
             log_ctx.log(
                 f"Error ({tpu.name}, {tpu.zone}): "
                 f"Allocation failed (attempt {attempt}/{max_attempts}). Retrying in 5s."
             )
             attempt += 1
-            time.sleep(5)
             continue
 
         # Get worker count
