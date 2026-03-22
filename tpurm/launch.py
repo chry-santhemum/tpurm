@@ -1,7 +1,12 @@
+import os
+import shlex
+import textwrap
+from pathlib import Path
 
 from .globals import ENV_VARS, DatasetName, DEFAULT_KEYS_DIR
+from .staging import stage_dir_to_log_dir
 from .tpu import TPU
-
+from .util_log import LogContext
 from .util_ssh import gcloud_ssh
 
 
@@ -12,6 +17,8 @@ def launch(
     project_name: str,
     stage_dir: str,
     datasets: list[DatasetName] | None = None,
+    *,
+    log_ctx: LogContext,
 ) -> int:
     """
     Dispatch a command on all TPU VM workers and return immediately.
@@ -24,7 +31,6 @@ def launch(
     os.makedirs(log_dir, exist_ok=True)
     os.chmod(log_dir, 0o777)
 
-    # Substitute placeholders in command
     real_command = command.format(
         log_dir=log_dir,
         run_name=run_name,
@@ -36,15 +42,17 @@ def launch(
     sa_key_file = f"{keys_dir}/bucket-{tpu.region}.json"
     runner_script_path = f"{stage_dir}/.tpurm/remote/launch_runner.sh"
     datasets_env = " ".join(datasets or [])
-    thread_log(f"Using service account: {tpu.service_account}")
-    thread_log(f"Running at {tpu.name} {tpu.zone}")
-    thread_log(f"Experiment logs at: {log_dir}", force_print=True)
+    log_ctx.log(f"Using service account: {tpu.service_account}")
+    log_ctx.log(f"Running at {tpu.name} {tpu.zone}")
+    log_ctx.log(f"Experiment logs at: {log_dir}", force_print=True)
+    
+    wandb_key: str = ENV_VARS["WANDB_KEY"]  # type: ignore
     launch_env = {
         "LOG_DIR": log_dir,
         "STAGE_DIR": stage_dir,
         "STAGE_DIR_SUFFIX": stage_dir_suffix,
         "TRAIN_COMMAND": real_command,
-        "WANDB_KEY": ENV_VARS["WANDB_KEY"],
+        "WANDB_KEY": wandb_key,
         "DATASETS": datasets_env,
         "TPU_BUCKET": tpu.bucket,
         "ZONE": tpu.zone,
@@ -81,23 +89,20 @@ def launch(
         """
     )
     result = gcloud_ssh(
-        tpu.name, tpu.zone, remote_cmd, 
+        tpu.name,
+        tpu.zone,
+        remote_cmd,
         operation="launch",
-        worker="all", 
-        timeout=None, 
-        capture_output=False, 
-        max_ssh_tries=3
+        worker="all",
+        timeout=None,
+        capture_output=False,
+        max_ssh_tries=3,
+        log_ctx=log_ctx,
     )
 
-    # This is the return code of the gcloud call, not the remote command
-    if result.retry_exhausted:
-        returncode = EXIT_CODE_SSH_RETRY
-    else:
-        returncode = result.returncode
-    if returncode == EXIT_CODE_SSH_RETRY:
-        thread_log(f"Failed to launch job: exit code {returncode} (SSH retries exceeded). Logs: {result.log_dir}")
-    elif returncode != 0:
-        thread_log(f"Failed to launch job: exit code {returncode}. Logs: {result.log_dir}")
+    returncode = EXIT_CODE_SSH_RETRY if result.retry_exhausted else result.returncode
+    if returncode != 0:
+        log_ctx.log(f"Failed to launch job: exit code {returncode}. Logs: {result.log_dir}")
     return returncode
 
 
@@ -117,7 +122,6 @@ def poll_launch(log_dir: str, expected_workers: int) -> int | None:
     return final_rc
 
 
-# Exit code signaling
 EXIT_CODE_FATAL = 2
 EXIT_CODE_SSH_RETRY = -1
 _FATAL_ERROR_PATTERNS = [
@@ -125,6 +129,7 @@ _FATAL_ERROR_PATTERNS = [
     "NameError:", "AttributeError:", "TypeError:",
     "KeyboardInterrupt",
 ]
+
 
 def has_fatal_error(log_path: str) -> bool:
     """Scan a launch log for fatal errors."""
@@ -136,6 +141,7 @@ def has_fatal_error(log_path: str) -> bool:
     except OSError:
         pass
     return False
+
 
 def has_fatal_error_in_logs(log_dir: str) -> bool:
     for p in sorted(Path(log_dir).glob("worker_*.log")):

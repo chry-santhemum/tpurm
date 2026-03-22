@@ -1,15 +1,15 @@
+import shlex
+import textwrap
 import uuid
 import time
 import threading
 
-from .common import (
-    TPU, AllocMode, REPO_ROOT,
-    thread_log,
-    gcloud_create_tpu, gcloud_describe_tpu,
-    run_remote_script,
-)
 from . import wheelhouse
-from .util_ssh import check_setup
+from .globals import REPO_ROOT
+from .tpu import TPU, AllocMode
+from .util_gcloud import gcloud_create, gcloud_describe
+from .util_log import LogContext
+from .util_ssh import check_setup, gcloud_ssh, read_remote_script
 
 ALLOCATION_MODES: dict[AllocMode, dict[str, str]] = {
     "spot": {
@@ -31,7 +31,13 @@ ALLOCATION_MODES: dict[AllocMode, dict[str, str]] = {
 _TERMINAL_TPU_STATES = {"PREEMPTED", "DELETING", "TERMINATED"}
 
 
-def _install_requirements(tpu: TPU, requirements_lock: str, requirements_hash: str) -> bool:
+def install_requirements(
+    tpu: TPU,
+    requirements_lock: str,
+    requirements_hash: str,
+    *,
+    log_ctx: LogContext,
+) -> bool:
     install_env = {
         "REQUIREMENTS_LOCK": requirements_lock,
         "REQUIREMENTS_HASH": requirements_hash,
@@ -39,23 +45,46 @@ def _install_requirements(tpu: TPU, requirements_lock: str, requirements_hash: s
     install_success = False
     assert tpu.num_workers is not None, "TPU must be allocated before initialization."
     if tpu.wheelhouse_tag and tpu.num_workers > 1:
-        if not wheelhouse.build(tpu, requirements_lock=requirements_lock):
-            thread_log("Warning: wheelhouse build failed")
+        if not wheelhouse.build(tpu, requirements_lock=requirements_lock, log_ctx=log_ctx):
+            log_ctx.log("Warning: wheelhouse build failed")
         install_success = wheelhouse.install(
             tpu,
             requirements_lock=requirements_lock,
+            log_ctx=log_ctx,
         )
         if not install_success:
-            thread_log("Warning: wheelhouse install failed; falling back to install.sh")
+            log_ctx.log("Warning: wheelhouse install failed; falling back to install.sh")
     if install_success:
         return True
-    return run_remote_script(tpu.name, tpu.zone, "install.sh", env=install_env, max_ssh_tries=3)
+    env_prefix = " ".join(f"{key}={shlex.quote(value)}" for key, value in install_env.items())
+    remote_cmd = textwrap.dedent(
+        f"""\
+        {env_prefix} bash -s <<'REMOTE_SCRIPT'
+        {read_remote_script("install.sh")}
+        REMOTE_SCRIPT
+        """
+    )
+    result = gcloud_ssh(
+        tpu.name,
+        tpu.zone,
+        remote_cmd,
+        operation="install",
+        worker="all",
+        timeout=None,
+        max_ssh_tries=3,
+        capture_output=False,
+        log_ctx=log_ctx,
+    )
+    if not result.ok:
+        log_ctx.log(f"install.sh failed on {tpu.name}: exit {result.returncode}. Logs: {result.log_dir}")
+    return result.ok
 
 
 def allocate(
     tpu_size: str, zone: str, max_attempts: int, 
     stop_events: list[threading.Event],
-    mode: AllocMode="spot", owner: str="atticusw"
+    log_ctx: LogContext,
+    mode: AllocMode="spot", owner: str="atticusw",
 ) -> TPU|None:
     """
     Try to allocate a TPU with a given size and zone.
@@ -68,23 +97,25 @@ def allocate(
     while attempt <= max_attempts:
         for stop_event in stop_events:
             if stop_event.is_set():
-                thread_log("Stop event set, aborting allocation.")
+                log_ctx.log("Stop event set, aborting allocation.")
                 return None
         
         # Generate new ID each time
         tpu_id = str(uuid.uuid4()).replace("-", "")[:6]
         tpu = TPU(size=tpu_size, id=tpu_id, zone=zone, mode=mode, owner=owner)
-        thread_log(f"Trying to allocate TPU: {tpu.name} in {tpu.zone} (attempt {attempt}/{max_attempts})")
+        log_ctx.log(f"Trying to allocate TPU: {tpu.name} in {tpu.zone} (attempt {attempt}/{max_attempts})")
 
-        result = gcloud_create_tpu(
-            tpu.name, tpu.zone,
-            tpu.config["accelerator_type"](tpu.size),
-            tpu.config["runtime_version"],
+        result = gcloud_create(
+            tpu.name,
+            tpu.zone,
+            accelerator_type=tpu.config["accelerator_type"](tpu.size),
+            runtime_version=tpu.config["runtime_version"],
             service_account=tpu.service_account,
             mode_flag=mode_cfg["direct_flag"],
+            log_ctx=log_ctx,
         )
-        if result is None or result.returncode != 0:
-            thread_log(
+        if result.returncode != 0:
+            log_ctx.log(
                 f"Error ({tpu.name}, {tpu.zone}): "
                 f"Allocation failed (attempt {attempt}/{max_attempts}). Retrying in 5s."
             )
@@ -93,9 +124,11 @@ def allocate(
             continue
 
         # Get worker count
-        _, _, _, n_workers = gcloud_describe_tpu(tpu.name, tpu.zone)
+        info = gcloud_describe(tpu.name, tpu.zone, log_ctx=log_ctx)
+        endpoints = info.get("networkEndpoints") if info is not None else None
+        n_workers = len(endpoints) if isinstance(endpoints, list) else None
         if n_workers is None:
-            thread_log(
+            log_ctx.log(
                 f"Error ({tpu.name}, {tpu.zone}): "
                 f"Allocation succeeded (attempt {attempt}/{max_attempts}), "
                 f"but could not get worker count immediately after allocation. TPU likely preempted."
@@ -105,79 +138,102 @@ def allocate(
             continue
         
         tpu.num_workers = n_workers
-        thread_log(f"Allocation successful ({tpu.name}, {tpu.zone}). Detected {n_workers} worker(s).")
+        log_ctx.log(f"Allocation successful ({tpu.name}, {tpu.zone}). Detected {n_workers} worker(s).")
         return tpu
-    thread_log(f"Error ({tpu.name}, {tpu.zone}): Failed to allocate TPU after {max_attempts} attempts.")
+    log_ctx.log(f"Error ({tpu.name}, {tpu.zone}): Failed to allocate TPU after {max_attempts} attempts.")
 
 
 def init_and_install(
     tpu: TPU, *,
     requirements_lock: str, max_attempts: int, settle_time: int,
     skip_upgrade: bool = False,
+    log_ctx: LogContext,
 ) -> bool:
     assert tpu.num_workers is not None, "TPU must be allocated before initialization."
     req_hash = wheelhouse.requirements_hash(requirements_lock)
     for attempt in range(1, max_attempts + 1):
-        exists, state, _, _ = gcloud_describe_tpu(tpu.name, tpu.zone)
-        if not exists or state in _TERMINAL_TPU_STATES:
-            thread_log(f"TPU {tpu.name} does not exist, or is in terminal state {state}. Aborting initialization.")
+        info = gcloud_describe(tpu.name, tpu.zone, log_ctx=log_ctx)
+        state = info.get("state") if info is not None else None
+        if info is None or state in _TERMINAL_TPU_STATES:
+            log_ctx.log(f"TPU {tpu.name} does not exist, or is in terminal state {state}. Aborting initialization.")
             return False
-        thread_log(f"Initialization attempt {attempt}/{max_attempts}")
+        log_ctx.log(f"Initialization attempt {attempt}/{max_attempts}")
 
-        setup = check_setup(tpu.name, tpu.zone, requirements_hash=req_hash)
+        setup = check_setup(tpu.name, tpu.zone, requirements_hash=req_hash, log_ctx=log_ctx)
         if setup is None:
-            thread_log("Warning: Setup check failed over SSH. Retrying...")
+            log_ctx.log("Warning: Setup check failed over SSH. Retrying...")
             continue
         if not setup["env"]:
             init_env = {"SKIP_UPGRADE": "1"} if skip_upgrade else {"SKIP_UPGRADE": "0"}
-            if not run_remote_script(tpu.name, tpu.zone, "init.sh", env=init_env, max_ssh_tries=3):
-                thread_log("init.sh failed. Retrying in 15s.")
+            env_prefix = " ".join(f"{key}={shlex.quote(value)}" for key, value in init_env.items())
+            remote_cmd = textwrap.dedent(
+                f"""\
+                {env_prefix} bash -s <<'REMOTE_SCRIPT'
+                {read_remote_script("init.sh")}
+                REMOTE_SCRIPT
+                """
+            )
+            result = gcloud_ssh(
+                tpu.name,
+                tpu.zone,
+                remote_cmd,
+                operation="init",
+                worker="all",
+                timeout=None,
+                max_ssh_tries=3,
+                capture_output=False,
+                log_ctx=log_ctx,
+            )
+            if not result.ok:
+                log_ctx.log(f"init.sh failed on {tpu.name}: exit {result.returncode}. Logs: {result.log_dir}")
                 time.sleep(15)
                 continue
-            thread_log(f"Waiting {settle_time}s for environment to settle...")
+            log_ctx.log(f"Waiting {settle_time}s for environment to settle...")
             time.sleep(settle_time)
-            setup = check_setup(tpu.name, tpu.zone, requirements_hash=req_hash)
+            setup = check_setup(tpu.name, tpu.zone, requirements_hash=req_hash, log_ctx=log_ctx)
             if setup is None or not setup["env"]:
-                thread_log("Warning: Setup check failed after init. Retrying...")
+                log_ctx.log("Warning: Setup check failed after init. Retrying...")
                 continue
 
         if not setup["requirements"]:
-            if not _install_requirements(tpu, requirements_lock, req_hash):
-                thread_log("install.sh failed. Retrying in 30s.")
+            if not install_requirements(tpu, requirements_lock, req_hash, log_ctx=log_ctx):
                 time.sleep(30)
                 continue
-            setup = check_setup(tpu.name, tpu.zone, requirements_hash=req_hash)
+            setup = check_setup(tpu.name, tpu.zone, requirements_hash=req_hash, log_ctx=log_ctx)
             if setup is None or not setup["requirements"]:
-                thread_log("Warning: Setup check failed after install. Retrying...")
+                log_ctx.log("Warning: Setup check failed after install. Retrying...")
                 continue
-        thread_log("Initialization successful.")
+        log_ctx.log("Initialization successful.")
         return True
 
-    thread_log(f"Error: Failed to initialize all workers after {max_attempts} attempts")
+    log_ctx.log(f"Error: Failed to initialize all workers after {max_attempts} attempts")
     return False
 
 
-def ensure_ready(tpu: TPU, skip_upgrade: bool = False) -> bool:
+def ensure_ready(tpu: TPU, skip_upgrade: bool = False, *, log_ctx: LogContext) -> bool:
     """Ensure TPU has correct environment. Returns True when ready."""
     requirements_lock = str(REPO_ROOT / "requirements.lock")
     req_hash = wheelhouse.requirements_hash(requirements_lock)
-    setup = check_setup(tpu.name, tpu.zone, requirements_hash=req_hash)
+    setup = check_setup(tpu.name, tpu.zone, requirements_hash=req_hash, log_ctx=log_ctx)
     if setup is None or not setup["env"] or not setup["requirements"]:
-        thread_log(f"Initializing {tpu.name}...")
+        log_ctx.log(f"Initializing {tpu.name}...")
         if not init_and_install(
             tpu,
             requirements_lock=requirements_lock,
             max_attempts=5, settle_time=180,
             skip_upgrade=skip_upgrade,
+            log_ctx=log_ctx,
         ):
-            thread_log(f"init_and_install failed for {tpu.name}")
+            log_ctx.log(f"init_and_install failed for {tpu.name}")
             return False
 
     # Populate num_workers here
     if tpu.num_workers is None:
-        exists, _, _, n_workers = gcloud_describe_tpu(tpu.name, tpu.zone)
-        if not exists or n_workers is None:
-            thread_log(f"Could not determine num_workers for ready TPU {tpu.name}")
+        info = gcloud_describe(tpu.name, tpu.zone, log_ctx=log_ctx)
+        endpoints = info.get("networkEndpoints") if info is not None else None
+        n_workers = len(endpoints) if isinstance(endpoints, list) else None
+        if info is None or n_workers is None:
+            log_ctx.log(f"Could not determine num_workers for ready TPU {tpu.name}")
             return False
         tpu.num_workers = n_workers
     return True

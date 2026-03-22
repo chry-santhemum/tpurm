@@ -32,8 +32,9 @@ def gcloud_create(
         f"--accelerator-type={accelerator_type}",
         f"--version={runtime_version}",
         f"--service-account={service_account}",
-        f"--mode-flag={mode_flag}",
     ]
+    if mode_flag:
+        cmd.append(mode_flag)
     return run_cmd(cmd, log_ctx=log_ctx)
 
 def gcloud_delete(

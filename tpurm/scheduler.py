@@ -10,7 +10,6 @@
 # Relax restart constraint when job failed and no checkpoints saved
 # Make allocator/schedule hparams part of the file state, hence modifiable mid-run
 
-
 import copy
 import os
 import re
@@ -27,7 +26,6 @@ from .common import (
     _thread_local, thread_log, set_thread_vars,
     zone_to_region, name_to_tpu, size_to_family,
     gcloud_delete_tpu, gcloud_describe_tpu, list_tpus,
-    check_vacancy,
 )
 from .state import FILE_STATE_DIR, Filestate, Job, ManagedTPU
 from .staging import (
@@ -37,7 +35,12 @@ from .staging import (
 from .steal import scan_target
 from .initialize import allocate, ensure_ready
 from .freeze import freeze
-from .util_ssh import check_setup
+from .util_log import LogContext
+from .util_ssh import check_setup, check_vacancy
+
+
+def _current_log_ctx() -> LogContext:
+    return LogContext(getattr(_thread_local, "log_file", None))
 
 
 
@@ -139,7 +142,7 @@ def sync_state(file_state: Filestate, startup: bool=False):
     if len(updates) == 0:
         return
 
-    def sync_one(key: tuple[str, str]):
+    def sync_one(key: tuple[str, str], log_ctx: LogContext):
         tpu_name, zone = key
         out = updates[key]
         exists, state, health, num_workers = gcloud_describe_tpu(tpu_name, zone)
@@ -154,10 +157,10 @@ def sync_state(file_state: Filestate, startup: bool=False):
             if state != "READY" or (health is not None and health != "HEALTHY"):
                 out["status"] = "busy"
                 return
-            setup = check_setup(tpu_name, zone, max_ssh_tries=1)
+            setup = check_setup(tpu_name, zone, log_ctx=log_ctx, max_ssh_tries=1)
             if setup is not None:
                 out["datasets"] = setup["datasets"]
-            vacant_ok = check_vacancy(tpu_name, zone, max_ssh_tries=1)
+            vacant_ok = check_vacancy(tpu_name, zone, log_ctx=log_ctx, max_ssh_tries=1)
             unknowns = int(setup is None) + int(vacant_ok is None)
             if vacant_ok is None:
                 out["status"] = "untrack" if unknowns >= 2 else "busy"
@@ -173,7 +176,7 @@ def sync_state(file_state: Filestate, startup: bool=False):
     parent_log_file = getattr(_thread_local, "log_file", None)
     def sync_one_with_context(key: tuple[str, str]) -> dict[str, Any]:
         with set_thread_vars(log_file=parent_log_file):
-            return sync_one(key)
+            return sync_one(key, LogContext(parent_log_file))
     
     with ThreadPoolExecutor(max_workers=min(32, len(updates))) as executor:
         futures = [executor.submit(sync_one_with_context, key) for key in updates.keys()]
@@ -262,8 +265,14 @@ class Scheduler:
         sync_state(fs)
 
 
-    def try_alloc(self, worker_id: int, size: str, zone: str) -> bool:
-        tpu = allocate(size, zone, max_attempts=8, stop_events=[self._stop_event, self._alloc_sleep_event])
+    def try_alloc(self, worker_id: int, size: str, zone: str, *, log_ctx: LogContext) -> bool:
+        tpu = allocate(
+            size,
+            zone,
+            max_attempts=8,
+            stop_events=[self._stop_event, self._alloc_sleep_event],
+            log_ctx=log_ctx,
+        )
         if tpu is None:
             thread_log(f"[worker {worker_id}] Failed to allocate {size} in {zone}")
             return False
@@ -288,6 +297,7 @@ class Scheduler:
         curr_combo_pointer = 0
 
         with open(log_path, "w") as log_file, set_thread_vars(log_file=log_file):
+            log_ctx = LogContext(log_file)
             while True:
                 if self._stop_event.is_set():
                     thread_log(f"[worker {worker_id}] Exiting.", force_print=True)
@@ -320,14 +330,14 @@ class Scheduler:
                     size, zone = curr_combo[curr_combo_pointer]
                     curr_combo_pointer = (curr_combo_pointer + 1) % len(curr_combo)
                     
-                self.try_alloc(worker_id, size, zone)
+                self.try_alloc(worker_id, size, zone, log_ctx=log_ctx)
 
 
-    def try_init(self, worker_id: int, mt: ManagedTPU) -> bool:
+    def try_init(self, worker_id: int, mt: ManagedTPU, *, log_ctx: LogContext) -> bool:
         tpu = mt.tpu
         skip_upgrade = not mt.owned
 
-        if ensure_ready(tpu, skip_upgrade=skip_upgrade):
+        if ensure_ready(tpu, skip_upgrade=skip_upgrade, log_ctx=log_ctx):
             thread_log(f"[worker {worker_id}] Successfully initialized: {tpu.name}", force_print=True)
             with self.file_state.transact():
                 self.file_state._tpus[tpu.name] = ManagedTPU(tpu=tpu, owned=mt.owned, status="free")
@@ -343,6 +353,7 @@ class Scheduler:
     def init_worker(self, worker_id: int):
         log_path = self.log_dir / f"init_worker_{worker_id}.log"
         with open(log_path, "a+") as log_file, set_thread_vars(log_file=log_file):
+            log_ctx = LogContext(log_file)
             while not self._stop_event.is_set():
                 target = None
                 with self.file_state.transact():
@@ -360,7 +371,7 @@ class Scheduler:
                 log_file.flush()
                 thread_log(f"[worker {worker_id}] Claimed: {target.tpu.name}", force_print=True)
 
-                init_success = self.try_init(worker_id, target)
+                init_success = self.try_init(worker_id, target, log_ctx=log_ctx)
                 thread_log(f"[worker {worker_id}] init success {init_success}: {target.tpu.name}", force_print=True)
                     
             thread_log(f"[worker {worker_id}] Exiting.", force_print=True)
@@ -428,6 +439,7 @@ class Scheduler:
 
     def steal_tick(self):
         """Steal a TPU for the current _steal_job."""
+        log_ctx = _current_log_ctx()
         if self._steal_target is None:  # Look for fresh target
             job = self._steal_job  # TODO: deal with when job is cancelled here
             assert job is not None
@@ -437,7 +449,7 @@ class Scheduler:
                 cfg = TPU_CONFIGS[family]
                 regions.extend([zone_to_region(z) for z in cfg["allowed_zones"]])
 
-            vacant_vms = scan_target(job.tpu_size, job.region or regions)
+            vacant_vms = scan_target(job.tpu_size, job.region or regions, log_ctx=log_ctx)
             vacant_tpus = [tpu for tpu in [name_to_tpu(name, zone) for name, zone in vacant_vms] if tpu is not None]
             _, _, tpus = self.file_state.snapshot()
             tracked_names = set(tpus.keys())
@@ -464,7 +476,7 @@ class Scheduler:
                 self._steal_target = None
                 return
             tpu, started_at = self._steal_target
-            info = check_vacancy(tpu.name, tpu.zone)
+            info = check_vacancy(tpu.name, tpu.zone, log_ctx=log_ctx)
             elapsed = time.time() - started_at
             if info is None or not info[0]:
                 if info is None:
@@ -502,6 +514,7 @@ class Scheduler:
     def launch_job(self, job_id: int, tpu_name: str):
         log_path = self.log_dir / f"job_{job_id}.log"
         with open(log_path, "a") as log_file, set_thread_vars(log_file=log_file):
+            log_ctx = LogContext(log_file)
             thread_log(f"[job {job_id}] Launching on {tpu_name}...", force_print=True)
 
             fs = self.file_state
@@ -522,12 +535,12 @@ class Scheduler:
                 mt = copy.deepcopy(tracked_mt)
 
             # One last check that TPU is still available
-            if not ensure_ready(mt.tpu, skip_upgrade=not mt.owned):
+            if not ensure_ready(mt.tpu, skip_upgrade=not mt.owned, log_ctx=log_ctx):
                 thread_log(f"[job {job_id}] readiness check failed before launch")
                 self.finalize_job(job, EXIT_CODE_SSH_RETRY)
                 return
 
-            info = check_vacancy(mt.tpu.name, mt.tpu.zone, max_ssh_tries=1)
+            info = check_vacancy(mt.tpu.name, mt.tpu.zone, log_ctx=log_ctx, max_ssh_tries=1)
             if info is None or not info[0]:
                 with fs.transact():
                     tracked_job = fs._jobs[job_id]
@@ -544,6 +557,7 @@ class Scheduler:
                 mt.tpu, job.command, stage_dir=job.stage_dir,
                 run_name=job.run_name, project_name=job.project_name,
                 datasets=job.datasets,
+                log_ctx=log_ctx,
             )
             if returncode != 0:  # Job failed to start
                 self.finalize_job(job, returncode)

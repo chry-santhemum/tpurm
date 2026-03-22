@@ -8,9 +8,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TypedDict, cast, get_args
 
-from .globals import DatasetName, NFS_SSD_US, NFS_US, REPO_ROOT
+from .globals import DatasetName, NFS_SSD_US, NFS_US, REMOTE_SCRIPTS_DIR, REPO_ROOT
 from .tpu import name_to_tpu
 from .util_log import LogContext, run_cmd
+
+def read_remote_script(name: str) -> str:
+    return (REMOTE_SCRIPTS_DIR / name).read_text()
 
 def ensure_ssh_key(log_ctx: LogContext) -> None:
     key_path = Path.home() / ".ssh" / "google_compute_engine"

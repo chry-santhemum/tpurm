@@ -24,6 +24,7 @@ EXIT_FILE="${LOG_DIR}/exit_${WORKER_ID}.txt"
 PID_FILE="${LOG_DIR}/pid_${WORKER_ID}.txt"
 WARMUP_SCRIPT="${SCRIPT_DIR}/warmup.sh"
 LOCAL_WORK_DIR="${HOME}/${STAGE_DIR_SUFFIX}"
+REMOTE_WANDB_DIR="${HOME}/.cache/tpurm/wandb/${STAGE_DIR_SUFFIX}/${WORKER_ID}"
 BOOTSTRAP_STAGE=bootstrap_start
 
 log_bootstrap() {
@@ -93,6 +94,8 @@ fi
 
 BOOTSTRAP_STAGE=wandb_login
 log_bootstrap "starting $BOOTSTRAP_STAGE"
+mkdir -p "$REMOTE_WANDB_DIR"
+export WANDB_DIR="$REMOTE_WANDB_DIR"
 wandb login "$WANDB_KEY"
 log_bootstrap "finished $BOOTSTRAP_STAGE"
 
