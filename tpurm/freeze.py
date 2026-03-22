@@ -1,8 +1,7 @@
-"""Freeze current pip environment into requirements.lock."""
-
 import subprocess
 import sys
-from .common import REPO_ROOT
+
+from .globals import REPO_ROOT
 
 # Packages that are conda-specific or not needed on remote TPU VMs.
 EXCLUDE = {
@@ -23,6 +22,7 @@ EXCLUDE = {
 }
 
 def freeze():
+    """Freeze current pip environment into requirements.lock."""
     result = subprocess.run(
         [sys.executable, "-m", "pip", "list", "--format=freeze"],
         capture_output=True, text=True, check=True,

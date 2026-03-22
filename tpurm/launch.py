@@ -1,10 +1,8 @@
-import dotenv
-from .globals import DatasetName, DEFAULT_KEYS_DIR
-from .tpu import TPU
-from .util_ssh import gcloud_ssh
 
-dotenv.load_dotenv(Path.home() / ".env")
-WANDB_KEY = os.getenv("WANDB_KEY")
+from .globals import ENV_VARS, DatasetName, DEFAULT_KEYS_DIR
+from .tpu import TPU
+
+from .util_ssh import gcloud_ssh
 
 
 def launch(
@@ -46,7 +44,7 @@ def launch(
         "STAGE_DIR": stage_dir,
         "STAGE_DIR_SUFFIX": stage_dir_suffix,
         "TRAIN_COMMAND": real_command,
-        "WANDB_KEY": WANDB_KEY or "",
+        "WANDB_KEY": ENV_VARS["WANDB_KEY"],
         "DATASETS": datasets_env,
         "TPU_BUCKET": tpu.bucket,
         "ZONE": tpu.zone,

@@ -6,17 +6,17 @@ from pathlib import Path
 from typing import Any, Literal
 from contextlib import contextmanager
 from dataclasses import dataclass, field, asdict
-from .common import TPU, DatasetName, REPO_ROOT
-from .staging import stage_dir_to_log_dir
 
+from .globals import REPO_ROOT, DatasetName
+from .tpu import TPU
+from .staging import stage_dir_to_log_dir
 
 FILE_STATE_DIR = REPO_ROOT / ".tpurm"
 
-JobStatus = Literal["queued", "waiting", "running", "done"]
+JobStatus = Literal["queued", "waiting", "running", "done"] 
 # waiting: job has been matched to a TPU, but it needs initialization/warmup
 
 TPUStatus = Literal["need_init", "initializing", "free", "busy"]
-
 
 @dataclass
 class Job:
@@ -42,14 +42,12 @@ class Job:
     def __post_init__(self):
         self.log_dir = stage_dir_to_log_dir(self.stage_dir)
 
-
 @dataclass
 class ManagedTPU:
     tpu: TPU
     owned: bool
     status: TPUStatus
     datasets: list[DatasetName]=field(default_factory=list)  # datasets that TPU has mounted
-
 
 class Filestate:
     """
@@ -110,8 +108,7 @@ class Filestate:
             os.fsync(f.fileno())
         os.replace(tmp, self._file_path)
 
-
-# helper for loading file state
+# helper for loading filestate
 def _deserialize_maybe_tpu(d: Any):
     """If d is dumped from a TPU, reconstruct it."""
     if isinstance(d, dict) and all(k in d for k in ["size", "mode", "owner", "id", "zone", "num_workers"]):

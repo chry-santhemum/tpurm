@@ -1,32 +1,12 @@
-"""Scan for vacant TPU VMs."""
-
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from .common import (
-    TPU_CONFIGS,
-    thread_log, zone_to_region, name_to_tpu,
-    check_vacancy, list_tpus, set_thread_vars, _thread_local,
-    gcloud_describe_tpu,
-)
+from .tpu import TPU_CONFIGS, zone_to_region, name_to_tpu
+from .util_log import LogContext
+from .util_ssh import check_vacancy
+from .util_gcloud import gcloud_list, gcloud_describe
 
-
-def get_zone_from_name(name: str) -> str:
-    """Find which zone a TPU lives in by parsing its family and scanning allowed zones."""
-    import re
-    m = re.match(r"^kmh-tpuvm-(v4|v5e|v5p|v6e)-", name)
-    if not m:
-        raise ValueError(f"Cannot parse TPU family from name: {name}")
-    family = m.group(1)
-    allowed_zones = TPU_CONFIGS[family]["allowed_zones"]
-    for zone in allowed_zones:
-        for vm in list_tpus(zone):
-            vm_name = vm.get("name", "").rsplit("/", 1)[-1]
-            if vm_name == name:
-                return zone
-    raise ValueError(f"TPU {name} not found in any zone for family {family}: {allowed_zones}")
-
-
-def scan_target(tpu_sizes: list[str], regions: list[str]) -> list[tuple[str, str]]:
+def scan_target(tpu_sizes: list[str], regions: list[str], *, log_ctx: LogContext) -> list[tuple[str, str]]:
+    """Returns the list of vacant TPUs matching the requested size(s) and region(s)."""
     zones = []
     family_to_chips: dict[str, set[int]] = {}
     for tpu_size in tpu_sizes:
@@ -37,12 +17,12 @@ def scan_target(tpu_sizes: list[str], regions: list[str]) -> list[tuple[str, str
 
     candidates = []  # (name, zone)
     for zone in sorted(set(zones)):
-        vms = list_tpus(zone)
+        vms = gcloud_list(zone, log_ctx=log_ctx)
         for vm in vms:
             name = vm.get("name", "").rsplit("/", 1)[-1]
             tpu = name_to_tpu(name, zone)
             if tpu is None:
-                thread_log(f"[steal.py] Could not parse TPU name: {name}. Continuing.")
+                log_ctx.log(f"Could not parse TPU name: {name}, skipping it.")
                 continue
             family, n_chips = tpu.size.split("-")
             chips = int(n_chips)
@@ -58,26 +38,28 @@ def scan_target(tpu_sizes: list[str], regions: list[str]) -> list[tuple[str, str
             candidates.append((name, zone))
 
     if not candidates:
-        thread_log("No READY VMs found matching the requested size(s).")
+        log_ctx.log("No READY VMs found matching the requested size(s).")
         return []
 
-    thread_log(f"Checking vacancy for {len(candidates)} VMs...")
-    log_file = getattr(_thread_local, 'log_file', None)
+    log_ctx.log(f"Checking vacancy for {len(candidates)} VMs...")
 
-    def _check(name, zone):
-        with set_thread_vars(log_file=log_file):
-            exists, state, health, _ = gcloud_describe_tpu(name, zone)
-            if (not exists) or state != "READY" or (health is not None and health != "HEALTHY"):
-                thread_log(
-                    f"[steal.py] Skipping {name}: state={state}, health={health}"
-                )
-                return False, f"{state or 'UNKNOWN'}/{health or 'UNKNOWN'}"
-            return check_vacancy(name, zone)
+    def check_one(name, zone):
+        info = gcloud_describe(name, zone, log_ctx=log_ctx)
+        if info is None:
+            log_ctx.log(f"Skipping {name}: gcloud_describe failed.")
+            return None
+        if (
+            info["state"] != "READY" or
+            info["health"] != "HEALTHY"
+        ):
+            log_ctx.log(f"Skipping {name}: state={info['state']}, health={info['health']}.")
+            return False, f"{info["state"] or "N/A"}/{info["health"] or "N/A"}"
+        return check_vacancy(name, zone, log_ctx=log_ctx)
 
     results = {}
     with ThreadPoolExecutor(max_workers=8) as pool:
         futures = {
-            pool.submit(_check, name, zone): (name, zone)
+            pool.submit(check_one, name, zone): (name, zone)
             for name, zone in candidates
         }
         for fut in as_completed(futures):
@@ -86,21 +68,18 @@ def scan_target(tpu_sizes: list[str], regions: list[str]) -> list[tuple[str, str
             results[(name, zone)] = info
 
     # Print summary table
-    thread_log("")
-    thread_log(f"{'VM Name':<55} {'Zone':<20} {'Vacant':<10} {'Load'}")
-    thread_log("-" * 100)
+    log_ctx.log(f"{'VM Name':<55} {'Zone':<20} {'Vacant':<10} {'Load'}")
+    log_ctx.log("-" * 100)
     vacant_vms = []
     for name, zone in candidates:
         info = results[(name, zone)]
         if info is None:
-            status_str = "dead"
+            status_str = "Dead"
         elif info[0]:
-            status_str = "YES"
+            status_str = "Yes"
         else:
-            status_str = "no"
-        load_parts = info[1].split() if info is not None else []
-        load = load_parts[0] if load_parts else "?"
-        thread_log(f"{name:<55} {zone:<20} {status_str:<10} {load}")
+            status_str = "No"
+        log_ctx.log(f"{name:<55} {zone:<20} {status_str:<10} {info[1]}")
         if info is not None and info[0]:
             vacant_vms.append((name, zone))
     

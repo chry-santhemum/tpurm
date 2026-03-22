@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 
 from .globals import ENV_VARS
 
-
 # TPU configuration
 # To add a new config: add service accounts, bucket, bucket key
 TPU_CONFIGS: dict[str, dict[str, Any]] = {
@@ -48,7 +47,6 @@ REGION_BUCKETS = {
 
 AllocMode = Literal["spot", "preemptible", "persistent"]
 
-
 @dataclass
 class TPU:
     """TPU properties known at creation."""
@@ -73,19 +71,16 @@ class TPU:
         if self.zone not in self.config["allowed_zones"]:
             raise ValueError(f"{self.family} support zones: {allowed_zones}. Requested: {self.zone}")
 
-
 def zone_to_region(zone: str) -> str:
     region, part = zone.rsplit("-", 1)
     assert len(part) == 1 and part.islower(), f"Invalid zone format: {zone}"
     return region
-
 
 def size_to_family(tpu_size: str) -> str:
     prefix, _ = tpu_size.split("-")
     if prefix in ("v4", "v5e", "v5p", "v6e"):
         return prefix
     raise ValueError(f"Invalid TPU size: {tpu_size}. Expected v4-*, v5e-*, v5p-*, or v6e-*.")
-
 
 def name_to_tpu(name: str, zone: str) -> TPU | None:
     """

@@ -7,10 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
 
-
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_ROTATE_CHECK_EVERY = 100
-
 
 def maybe_rotate_log(file: TextIO) -> None:
     """If log file is larger than `LOG_MAX_BYTES`, clear first half."""
@@ -36,27 +34,28 @@ def maybe_rotate_log(file: TextIO) -> None:
     except Exception:
         pass
 
-
 @dataclass(slots=True)
 class LogContext:
-    """Handles log rotation."""
-    file: TextIO
+    """Logging to a file, handles log rotation."""
+    file: TextIO|None
     _write_count: int = 0
 
     def log(self, msg: str, *, force_print: bool = False) -> None:
         ts = time.strftime("%y-%m-%d %H:%M:%S")
         caller = inspect.currentframe().f_back.f_code.co_name  # type: ignore
         line = f"[{ts}] [{caller}]: {msg}"
+
+        if self.file is None:
+            print(line, flush=True)
+            return
+
         self.file.write(line + "\n")
         self.file.flush()
         self._write_count += 1
-
         if self._write_count % LOG_ROTATE_CHECK_EVERY == 0:
             maybe_rotate_log(self.file)
-
         if force_print:
             print(line, flush=True)
-
 
 def run_cmd(cmd: list[str], *, log_ctx: LogContext, **kwargs) -> subprocess.CompletedProcess:
     """

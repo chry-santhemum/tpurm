@@ -5,7 +5,7 @@ from typing import Optional, get_args
 
 from .common import thread_log, DatasetName
 from .scheduler import FILE_STATE_DIR, Scheduler
-from .steal import scan_target, get_zone_from_name
+from .steal import scan_target
 from .staging import stage_code, kill_remote_processes
 from .state import Filestate, Job
 from .freeze import freeze
@@ -114,7 +114,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # kill
     sub = subparsers.add_parser("kill", help="Kill remote TPU processes by TPU name")
-    sub.add_argument("tpu_name")
+    sub.add_argument("tpu_name", type=str, required=True)
+    sub.add_argument("--zone", type=str, required=True)
     
     # freeze
     sub = subparsers.add_parser("freeze", help="Freeze the environment")
@@ -159,8 +160,7 @@ def main(argv: list[str] | None = None) -> int:
     elif args.action == "cancel":
         cancel_job(args.id)
     elif args.action == "kill":
-        zone = get_zone_from_name(args.tpu_name)
-        return 0 if kill_remote_processes(args.tpu_name, zone, "/tmp/tpurm-kill-all-no-log-dir") else 1
+        return 0 if kill_remote_processes(args.tpu_name, args.zone, "/tmp/tpurm-kill-all-no-log-dir") else 1
     elif args.action == "scan":
         vacant = scan_target(args.tpu_size, args.region)
         thread_log(f"\n{len(vacant)} vacant TPU(s) found.", force_print=True)

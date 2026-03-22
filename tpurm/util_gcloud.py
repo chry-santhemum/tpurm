@@ -2,8 +2,8 @@ import json
 import shlex
 import subprocess
 from typing import Any
-from .util_log import run_cmd, LogContext
 
+from .util_log import run_cmd, LogContext
 
 def gcloud_list(zone: str, *, log_ctx: LogContext) -> list[dict]:
     cmd = [
@@ -16,7 +16,6 @@ def gcloud_list(zone: str, *, log_ctx: LogContext) -> list[dict]:
         log_ctx.log(f"Warning: gcloud list failed for zone {zone}: {result.stderr.strip()}")
         return []
     return json.loads(result.stdout)
-
 
 def gcloud_create(
     tpu_name: str, zone: str, *,
@@ -37,7 +36,6 @@ def gcloud_create(
     ]
     return run_cmd(cmd, log_ctx=log_ctx)
 
-
 def gcloud_delete(
     tpu_name: str, zone: str, *,
     log_ctx: LogContext
@@ -47,7 +45,6 @@ def gcloud_delete(
         f"--zone={zone}", "--quiet",
     ]
     return run_cmd(cmd, log_ctx=log_ctx)
-
 
 def gcloud_describe(
     tpu_name: str, zone: str, *,

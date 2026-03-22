@@ -8,10 +8,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TypedDict, cast, get_args
 
-from .globals import DatasetName, NFS_SSD_US, NFS_US, REMOTE_SCRIPTS_DIR, REPO_ROOT
+from .globals import DatasetName, NFS_SSD_US, NFS_US, REPO_ROOT
 from .tpu import name_to_tpu
 from .util_log import LogContext, run_cmd
-
 
 def ensure_ssh_key(log_ctx: LogContext) -> None:
     key_path = Path.home() / ".ssh" / "google_compute_engine"
@@ -25,7 +24,6 @@ def ensure_ssh_key(log_ctx: LogContext) -> None:
         check=True,
     )
 
-
 @dataclass(slots=True)
 class SSHResult:
     returncode: int  # -1 = retry exhausted
@@ -35,18 +33,15 @@ class SSHResult:
     @property
     def ok(self) -> bool:
         return self.returncode == 0
-
     @property
     def retry_exhausted(self) -> bool:
         return self.returncode == -1
-
 
 def ssh_log_dir(operation: str, tpu_name: str) -> Path:
     log_id = f"{time.strftime('%y%m%d%H%M%S')}_{tpu_name}_{uuid.uuid4().hex[:6]}"
     log_dir = REPO_ROOT / ".tpurm" / "logs" / "remote" / operation / log_id
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir
-
 
 def gcloud_ssh(
     tpu_name: str, zone: str, command: str, *,
@@ -122,45 +117,14 @@ def gcloud_ssh(
         return finish(-1)
 
 
-def run_remote_bash(
-    tpu_name: str, zone: str, *,
-    operation: str,
-    env: dict[str, str]|None,
-    script: str,
-    log_ctx: LogContext,
-    worker: str = "all",
-    timeout: float | None = None,
-    max_ssh_tries: int = 3,
-    capture_output: bool = False,
-) -> SSHResult:
-    """Small wrapper that builds the env vars and heredoc command."""
-    env_prefix = ""
-    if env:
-        env_prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
-    remote_cmd = f"{env_prefix} bash -s <<'REMOTE_SCRIPT'\n{script}\nREMOTE_SCRIPT"
-    return gcloud_ssh(
-        tpu_name, zone, remote_cmd,
-        operation=operation,
-        worker=worker,
-        timeout=timeout,
-        max_ssh_tries=max_ssh_tries,
-        capture_output=capture_output,
-        log_ctx=log_ctx,
-    )
-
-
-def read_remote_script(name: str) -> str:
-    return (REMOTE_SCRIPTS_DIR / name).read_text()
-
+# Helpers for checking if a TPU is ready to launch jobs
 
 _SETUP_MARKER = "__TPURM_SETUP__"
-
 
 class SetupStatus(TypedDict):
     env: bool
     requirements: bool
     datasets: list[DatasetName]
-
 
 def _parse_setup_line(line: str) -> dict[str, str] | None:
     if not line.startswith(_SETUP_MARKER + "\t"):
@@ -173,17 +137,17 @@ def _parse_setup_line(line: str) -> dict[str, str] | None:
         out[key] = value
     return out
 
-
 def check_setup(
-    tpu_name: str,
-    zone: str,
-    *,
+    tpu_name: str, zone: str, *,
     log_ctx: LogContext,
     requirements_hash: str | None = None,
     timeout: float = 15,
     max_ssh_tries: int = 3,
 ) -> SetupStatus | None:
-    """Check base environment, requirements stamp, and dataset mounts on all workers."""
+    """
+    Check base environment, requirements stamp, and dataset mounts on all workers.
+    Returns None if the SSH call failed.
+    """
     log_ctx.log(f"Checking setup on {tpu_name}...")
     dataset_names = cast(tuple[DatasetName, ...], get_args(DatasetName))
     dataset_checks = "\n".join(
@@ -211,18 +175,18 @@ def check_setup(
           "$wid" "$env" "$requirements" "$datasets"
         """
     )
-    env = None if requirements_hash is None else {"REQUIREMENTS_HASH": requirements_hash}
-    result = run_remote_bash(
-        tpu_name,
-        zone,
-        script=script,
-        log_ctx=log_ctx,
+    env_prefix = ""
+    if requirements_hash is not None:
+        env_prefix = f"REQUIREMENTS_HASH={shlex.quote(requirements_hash)}"
+    remote_cmd = f"{env_prefix} bash -s <<'REMOTE_SCRIPT'\n{script}\nREMOTE_SCRIPT"
+    result = gcloud_ssh(
+        tpu_name, zone, remote_cmd,
         operation="check_setup",
-        env=env,
         worker="all",
+        log_ctx=log_ctx,
         timeout=timeout,
-        capture_output=True,
         max_ssh_tries=max_ssh_tries,
+        capture_output=True,
     )
     if not result.ok:
         log_ctx.log(f"SSH failed on {tpu_name}: {result}")
@@ -275,11 +239,8 @@ def check_setup(
         "datasets": datasets,
     }
 
-
 def check_vacancy(
-    tpu_name: str,
-    zone: str,
-    *,
+    tpu_name: str, zone: str, *,
     log_ctx: LogContext,
     timeout: float = 15,
     max_ssh_tries: int = 3,
@@ -298,9 +259,7 @@ def check_vacancy(
         "cat /proc/loadavg 2>/dev/null || true"
     )
     result = gcloud_ssh(
-        tpu_name,
-        zone,
-        cmd,
+        tpu_name, zone, cmd,
         log_ctx=log_ctx,
         operation="check_vacancy",
         worker="0",
