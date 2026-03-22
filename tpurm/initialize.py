@@ -114,7 +114,6 @@ def allocate(
             mode_flag=mode_cfg["direct_flag"],
             log_ctx=log_ctx,
         )
-        time.sleep(15)
         if result.returncode != 0:
             log_ctx.log(
                 f"Error ({tpu.name}, {tpu.zone}): "
@@ -124,6 +123,7 @@ def allocate(
             continue
 
         # Get worker count
+        time.sleep(15)
         info = gcloud_describe(tpu.name, tpu.zone, log_ctx=log_ctx)
         endpoints = info.get("networkEndpoints") if info is not None else None
         n_workers = len(endpoints) if isinstance(endpoints, list) else None

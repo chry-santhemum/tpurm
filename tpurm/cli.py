@@ -149,12 +149,12 @@ def main(argv: list[str] | None = None) -> int:
 
     # daemon
     sub = subparsers.add_parser("start", help="Run the scheduler daemon")
-    sub.add_argument("--steal-wait", type=int, default=-1, help="Seconds to wait before stealing (-1 to disable)")
+    sub.add_argument("--steal-wait", type=int, default=300, help="Seconds to wait before stealing (-1 to disable)")
     sub.add_argument("--steal-max", type=int, default=2, help="Max jobs on stolen TPUs (-1 for unlimited)")
-    sub.add_argument("--alloc-max", type=int, default=4, help="Target number of owned TPUs (0 disables allocation)")
+    sub.add_argument("--alloc-max", type=int, default=6, help="Target number of owned TPUs (0 disables allocation)")
     sub.add_argument("--alloc-sizes", nargs="+", default=["v6e-64", "v5p-64"], help="TPU sizes to allocate")
     sub.add_argument("--alloc-regions", nargs="+", default=None, help="Restrict allocation to these regions")
-    sub.add_argument("--alloc-workers", type=int, default=4, help="Parallel allocation workers")
+    sub.add_argument("--alloc-workers", type=int, default=6, help="Parallel allocation workers")
     sub.add_argument("--init-workers", type=int, default=4, help="Parallel initialization workers")
 
     # stop
