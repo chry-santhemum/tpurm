@@ -571,6 +571,7 @@ class Scheduler:
             returncode = launch(
                 mt.tpu, job.command, stage_dir=job.stage_dir,
                 run_name=job.run_name, project_name=job.project_name,
+                resume_from=job.resume_from,
                 datasets=job.datasets,
                 log_dir=job.log_dir,
                 log_ctx=log_ctx,

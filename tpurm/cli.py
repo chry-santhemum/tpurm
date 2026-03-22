@@ -9,8 +9,15 @@ from .filestate import FILE_STATE_DIR, Filestate, Job
 from .scheduler import Scheduler, allocation_combos
 from .staging import stage_code, stage_dir_to_log_dir
 from .steal import scan_target
+from .tpu import REGION_BUCKETS
 from .util_log import LogContext
 from .util_ssh import kill_remote_processes
+
+def infer_resume_region(resume_from: str) -> str:
+    for region, bucket in REGION_BUCKETS.items():
+        if resume_from == bucket or resume_from.startswith(bucket + "/"):
+            return region
+    raise ValueError(f"Could not infer region from resume checkpoint: {resume_from}")
 
 
 def submit_job(
@@ -20,6 +27,7 @@ def submit_job(
     project_name: str,
     command: str | None,
     command_path: str | None,
+    resume_from: str | None,
     datasets: list[DatasetName],
     priority: int,
     max_att: int,
@@ -33,6 +41,11 @@ def submit_job(
         command = Path(command_path).read_text().strip()  # type: ignore
     if command.startswith("python "):
         raise ValueError("Use python3.13 instead of python.")
+    if resume_from is not None:
+        resume_region = infer_resume_region(resume_from)
+        if region != [resume_region]:
+            log_ctx.log(f"Pinning job to region {resume_region} for resume checkpoint {resume_from}")
+        region = [resume_region]
     if len(allocation_combos(tpu_size, region)) == 0:
         raise ValueError("No valid TPU size/region combination is possible for this job request.")
     freeze()
@@ -46,6 +59,7 @@ def submit_job(
             id=job_id,
             created_at=time.time(),
             command=command,
+            resume_from=resume_from,
             tpu_size=tpu_size,
             region=region,
             datasets=datasets,
@@ -107,6 +121,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_argument("--project-name", required=True)
     sub.add_argument("--command", default=None)
     sub.add_argument("--command-path", default=None)
+    sub.add_argument("--resume-from", default=None)
     sub.add_argument("--dataset", nargs="+", choices=list(get_args(DatasetName)), required=True)
     sub.add_argument("--priority", type=int, default=0, help="Priority of the job")
     sub.add_argument("--max-att", type=int, default=0, help="Max number of attempts (including first run)")
@@ -161,6 +176,7 @@ def main(argv: list[str] | None = None) -> int:
             project_name=args.project_name,
             command=args.command,
             command_path=args.command_path,
+            resume_from=args.resume_from,
             datasets=args.dataset,
             priority=args.priority,
             max_att=args.max_att,

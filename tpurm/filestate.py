@@ -38,6 +38,7 @@ class Job:
     attempt: int
     assigned_tpu: TPU|None
     status: JobStatus
+    resume_from: str|None = None
 
     def __post_init__(self):
         self.log_dir = stage_dir_to_log_dir(self.stage_dir, attempt=self.attempt)
