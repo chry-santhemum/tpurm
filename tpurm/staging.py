@@ -11,12 +11,12 @@ from .util_log import run_cmd, LogContext
 
 RETENTION_DAYS = 7
 
-def stage_dir_to_log_dir(stage_dir: str, *, root: str = NFS_SSD_US, attempt: int = 1) -> str:
+def stage_dir_to_log_root(stage_dir: str, *, root: str = NFS_SSD_US) -> str:
     stage_dir_suffix = stage_dir.split("/staging/")[-1]
-    log_dir = Path(root) / "logs" / stage_dir_suffix
-    if attempt > 1:
-        log_dir = log_dir / f"attempt_{attempt}"
-    return str(log_dir)
+    return str(Path(root) / "logs" / stage_dir_suffix)
+
+def stage_dir_to_log_dir(stage_dir: str, *, root: str = NFS_SSD_US, attempt: int = 1) -> str:
+    return str(Path(stage_dir_to_log_root(stage_dir, root=root)) / f"attempt_{attempt}")
 
 def is_git_managed(path: Path) -> bool:
     """Checks if `path` is inside a git work tree."""
@@ -137,7 +137,7 @@ def stage_code(run_name: str, project_name: str, *, log_ctx: LogContext, retain=
         if entry.stat().st_mtime < cutoff:
             log_ctx.log(f"  Removing {entry.name}")
             shutil.rmtree(entry, ignore_errors=True)
-            shutil.rmtree(Path(stage_dir_to_log_dir(str(entry), root=root)), ignore_errors=True)
+            shutil.rmtree(Path(stage_dir_to_log_root(str(entry), root=root)), ignore_errors=True)
     log_ctx.log("Done cleaning up.")
 
     return stage_dir

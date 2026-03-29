@@ -48,12 +48,14 @@ def scan_target(tpu_sizes: list[str], regions: list[str], *, log_ctx: LogContext
         if info is None:
             log_ctx.log(f"Skipping {name}: gcloud_describe failed.")
             return None
+        state = info.get("state")
+        health = info.get("health")
         if (
-            info["state"] != "READY" or
-            info["health"] != "HEALTHY"
+            state != "READY" or
+            (health is not None and health != "HEALTHY")
         ):
-            log_ctx.log(f"Skipping {name}: state={info['state']}, health={info['health']}.")
-            return False, f"{info["state"] or "N/A"}/{info["health"] or "N/A"}"
+            log_ctx.log(f"Skipping {name}: state={state}, health={health}.")
+            return False, f"{state or 'N/A'}/{health or 'N/A'}"
         return check_vacancy(name, zone, log_ctx=log_ctx)
 
     results = {}

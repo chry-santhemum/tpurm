@@ -89,10 +89,12 @@ class Filestate:
             return
         with open(self._file_path) as f:
             data = json.load(f)
-        self._jobs = [
-            Job(**{k: _deserialize_maybe_tpu(v) for k, v in job.items() if k != "log_dir"})
-            for job in data["jobs"]
-        ]
+        self._jobs = []
+        for job_data in data["jobs"]:
+            job = Job(**{k: _deserialize_maybe_tpu(v) for k, v in job_data.items() if k != "log_dir"})
+            if isinstance(job_data.get("log_dir"), str):
+                job.log_dir = job_data["log_dir"]
+            self._jobs.append(job)
         self._tpus = {
             tpu_name: ManagedTPU(**{k: _deserialize_maybe_tpu(v) for k, v in mt.items()})
             for tpu_name, mt in data["tpus"].items()

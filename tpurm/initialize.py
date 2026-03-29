@@ -1,5 +1,4 @@
 import shlex
-import textwrap
 import uuid
 import time
 import threading
@@ -57,13 +56,8 @@ def install_requirements(
     if install_success:
         return True
     env_prefix = " ".join(f"{key}={shlex.quote(value)}" for key, value in install_env.items())
-    remote_cmd = textwrap.dedent(
-        f"""\
-        {env_prefix} bash -s <<'REMOTE_SCRIPT'
-        {read_remote_script("install.sh")}
-        REMOTE_SCRIPT
-        """
-    )
+    script = read_remote_script("install.sh").rstrip()
+    remote_cmd = f"{env_prefix} bash -s <<'REMOTE_SCRIPT'\n{script}\nREMOTE_SCRIPT"
     result = gcloud_ssh(
         tpu.name,
         tpu.zone,
@@ -166,13 +160,8 @@ def init_and_install(
         if not setup["env"]:
             init_env = {"SKIP_UPGRADE": "1"} if skip_upgrade else {"SKIP_UPGRADE": "0"}
             env_prefix = " ".join(f"{key}={shlex.quote(value)}" for key, value in init_env.items())
-            remote_cmd = textwrap.dedent(
-                f"""\
-                {env_prefix} bash -s <<'REMOTE_SCRIPT'
-                {read_remote_script("init.sh")}
-                REMOTE_SCRIPT
-                """
-            )
+            script = read_remote_script("init.sh").rstrip()
+            remote_cmd = f"{env_prefix} bash -s <<'REMOTE_SCRIPT'\n{script}\nREMOTE_SCRIPT"
             result = gcloud_ssh(
                 tpu.name,
                 tpu.zone,

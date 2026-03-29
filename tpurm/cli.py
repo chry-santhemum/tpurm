@@ -1,4 +1,6 @@
 import argparse
+import shlex
+import shutil
 import time
 from pathlib import Path
 from typing import get_args
@@ -7,7 +9,7 @@ from .freeze import freeze
 from .globals import DatasetName
 from .filestate import FILE_STATE_DIR, Filestate, Job
 from .scheduler import Scheduler, allocation_combos
-from .staging import stage_code, stage_dir_to_log_dir
+from .staging import stage_code, stage_dir_to_log_dir, stage_dir_to_log_root
 from .steal import scan_target
 from .tpu import REGION_BUCKETS
 from .util_log import LogContext
@@ -82,6 +84,24 @@ def resume_job(job_id: int, *, log_ctx: LogContext, state_dir: Path = FILE_STATE
         if not (0 <= job_id < len(fs._jobs)):
             raise ValueError(f"Job {job_id} not found.")
         job = fs._jobs[job_id]
+        log_root = Path(stage_dir_to_log_root(job.stage_dir))
+        log_dir = Path(stage_dir_to_log_dir(job.stage_dir, attempt=1))
+        if log_root.exists():
+            try:
+                shutil.rmtree(log_root)
+            except PermissionError as exc:
+                sudo_rm = f"sudo rm -rf {shlex.quote(str(log_root))}"
+                recreate = (
+                    f"mkdir -p {shlex.quote(str(log_dir))} && "
+                    f"chmod 777 {shlex.quote(str(log_dir))}"
+                )
+                raise PermissionError(
+                    "Could not clear existing logs during resume.\n"
+                    f"Run:\n  {sudo_rm}\n  {recreate}\n"
+                    f"Then rerun: tpurm resume {job_id}"
+                ) from exc
+            log_ctx.log(f"Cleared existing logs at {log_root}")
+        log_dir.mkdir(parents=True, exist_ok=True)
         job.status = "queued"
         job.attempt = 1
         job.log_dir = stage_dir_to_log_dir(job.stage_dir, attempt=job.attempt)
@@ -149,13 +169,13 @@ def main(argv: list[str] | None = None) -> int:
 
     # daemon
     sub = subparsers.add_parser("start", help="Run the scheduler daemon")
-    sub.add_argument("--steal-wait", type=int, default=300, help="Seconds to wait before stealing (-1 to disable)")
-    sub.add_argument("--steal-max", type=int, default=2, help="Max jobs on stolen TPUs (-1 for unlimited)")
-    sub.add_argument("--alloc-max", type=int, default=6, help="Target number of owned TPUs (0 disables allocation)")
-    sub.add_argument("--alloc-sizes", nargs="+", default=["v6e-64", "v5p-64"], help="TPU sizes to allocate")
-    sub.add_argument("--alloc-regions", nargs="+", default=None, help="Restrict allocation to these regions")
-    sub.add_argument("--alloc-workers", type=int, default=6, help="Parallel allocation workers")
-    sub.add_argument("--init-workers", type=int, default=4, help="Parallel initialization workers")
+    sub.add_argument("--steal-wait", type=int, default=300, help="-1 to disable stealing")
+    sub.add_argument("--steal-max", type=int, default=-1, help="-1 for unlimited stealing")
+    sub.add_argument("--alloc-max", type=int, default=6)
+    sub.add_argument("--alloc-sizes", nargs="+", default=["v6e-64", "v5p-64"])
+    sub.add_argument("--alloc-regions", nargs="+", default=None)
+    sub.add_argument("--alloc-workers", type=int, default=None, help="Defaults to alloc_max")
+    sub.add_argument("--init-workers", type=int, default=None, help="Defaults to alloc_max")
 
     # stop
     subparsers.add_parser("stop", help="Gracefully stop the daemon")
@@ -199,8 +219,12 @@ def main(argv: list[str] | None = None) -> int:
     elif args.action == "freeze":
         freeze()
     elif args.action == "start":
-        if args.alloc_max > 0 and args.alloc_workers > 0 and len(allocation_combos(args.alloc_sizes, args.alloc_regions)) == 0:
+        if len(allocation_combos(args.alloc_sizes, args.alloc_regions)) == 0:
             parser.error("No valid allocation size/region combination is possible.")
+        if args.alloc_workers is None:
+            args.alloc_workers = args.alloc_max
+        if args.init_workers is None:
+            args.init_workers = args.alloc_max
         scheduler = Scheduler(
             alloc_max=args.alloc_max,
             alloc_sizes=args.alloc_sizes,

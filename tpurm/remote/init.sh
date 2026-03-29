@@ -31,11 +31,9 @@ ret=1
 for attempt in $(seq 1 $APT_RETRIES); do
     echo "[init.sh] apt init attempt $attempt/$APT_RETRIES"
     sudo dpkg --configure -a || true
-    sudo apt-get -y update || true
-    if [ "${SKIP_UPGRADE}" != "1" ]; then
-        sudo apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade || true
-    fi
+    sudo apt-get -y -f install || true
     sudo add-apt-repository -y ppa:deadsnakes/ppa || true
+    sudo apt-get -y update || true
     sudo apt-get -y install nfs-common python3.13 python3.13-venv python3.13-dev >/dev/null && ret=0 || ret=$?
     if [ "$ret" -eq 0 ]; then
         break

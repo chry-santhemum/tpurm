@@ -1,8 +1,13 @@
+import os
 import json
 import shlex
 import subprocess
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
+from .globals import DEFAULT_KEYS_DIR
+from .tpu import REGION_BUCKETS
 from .util_log import run_cmd, LogContext
 
 def gcloud_list(zone: str, *, log_ctx: LogContext) -> list[dict]:
@@ -73,10 +78,36 @@ def gcloud_describe(
     log_ctx.log(f"TPU info: {info}")
     return info
 
+def _storage_key_file(path: str) -> Path | None:
+    for region, bucket in REGION_BUCKETS.items():
+        if path == bucket or path.startswith(bucket + "/"):
+            return Path(DEFAULT_KEYS_DIR) / f"bucket-{region}.json"
+    return None
+
 def gcloud_storage_ls(path: str, *, log_ctx: LogContext) -> list[str]:
     cmd = ["gcloud", "storage", "ls", path]
     log_ctx.log(f"$ {shlex.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    key_file = _storage_key_file(path)
+    if key_file is not None and key_file.is_file():
+        with TemporaryDirectory(prefix="tpurm-gcloud-") as config_dir:
+            env = os.environ.copy()
+            env["CLOUDSDK_CONFIG"] = config_dir
+            env["CLOUDSDK_CORE_DISABLE_PROMPTS"] = "1"
+            env["CLOUDSDK_CORE_DISABLE_FILE_LOGGING"] = "1"
+            env["GOOGLE_APPLICATION_CREDENTIALS"] = str(key_file)
+            auth_cmd = [
+                "gcloud", "auth", "activate-service-account",
+                f"--key-file={key_file}", "--quiet",
+            ]
+            auth_result = subprocess.run(auth_cmd, capture_output=True, text=True, env=env)
+            if auth_result.returncode != 0:
+                stderr = auth_result.stderr.strip()
+                if stderr:
+                    log_ctx.log(f"Warning: gcloud auth failed for {path}: {stderr}")
+                return []
+            result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    else:
+        result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         stderr = result.stderr.strip()
         if stderr:

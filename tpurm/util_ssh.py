@@ -1,5 +1,6 @@
 import json
 import shlex
+import shutil
 import subprocess
 import textwrap
 import time
@@ -11,6 +12,8 @@ from typing import TypedDict, cast, get_args
 from .globals import DatasetName, NFS_SSD_US, NFS_US, REMOTE_SCRIPTS_DIR, REPO_ROOT
 from .tpu import name_to_tpu
 from .util_log import LogContext, run_cmd
+
+SSH_LOG_KEEP = 10
 
 def read_remote_script(name: str) -> str:
     return (REMOTE_SCRIPTS_DIR / name).read_text()
@@ -45,6 +48,18 @@ def ssh_log_dir(operation: str, tpu_name: str) -> Path:
     log_dir = REPO_ROOT / ".tpurm" / "logs" / "remote" / operation / log_id
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir
+
+def prune_old_ssh_logs(log_root: Path) -> None:
+    try:
+        done = sorted(
+            path
+            for path in log_root.iterdir()
+            if path.is_dir() and (path / "result.json").exists()
+        )
+    except OSError:
+        return
+    for old_dir in done[:-SSH_LOG_KEEP]:
+        shutil.rmtree(old_dir, ignore_errors=True)
 
 def gcloud_ssh(
     tpu_name: str, zone: str, command: str, *,
@@ -86,6 +101,7 @@ def gcloud_ssh(
                 "ended_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             }, indent=4)
         )
+        prune_old_ssh_logs(log_dir.parent)
         return result
 
     assert max_ssh_tries >= 1
@@ -96,10 +112,12 @@ def gcloud_ssh(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, timeout=timeout
             )
-            output = proc.stdout
+            output = proc.stdout or ""
             returncode = proc.returncode
         except subprocess.TimeoutExpired as exc:
-            output: str = exc.stdout or ""  # type: ignore
+            output = exc.stdout or ""
+            if isinstance(output, bytes):
+                output = output.decode(errors="replace")
             returncode = -1
             retry_reason = f"timed out after {timeout}s"
 
@@ -130,13 +148,8 @@ def kill_remote_processes(
     max_ssh_tries: int = 2,
 ) -> bool:
     log_ctx.log(f"Killing REMOTE processes on {tpu_name}...")
-    remote_cmd = textwrap.dedent(
-        f"""\
-        LOG_DIR={shlex.quote(log_dir)} bash -s <<'REMOTE_SCRIPT'
-        {read_remote_script("kill.sh")}
-        REMOTE_SCRIPT
-        """
-    )
+    script = read_remote_script("kill.sh").rstrip()
+    remote_cmd = f"LOG_DIR={shlex.quote(log_dir)} bash -s <<'REMOTE_SCRIPT'\n{script}\nREMOTE_SCRIPT"
     result = gcloud_ssh(
         tpu_name,
         zone,
@@ -325,12 +338,12 @@ def check_vacancy(
     lockfile_present = lockfile_output == "PRESENT"
 
     tpu = name_to_tpu(tpu_name, zone)
-    if tpu is not None and tpu.owner == "atticusw":
+    if tpu is not None:
         if python_output:
             python_examples = "\n".join(python_output.splitlines()[:1])
             log_ctx.log(f"  {tpu_name}: python process example:\n{python_examples}")
         if holder_output:
-            holder_examples = "\n".join(holder_output.splitlines()[:3])
+            holder_examples = "\n".join(holder_output.splitlines()[:2])
             log_ctx.log(f"  {tpu_name}: TPU holder examples:\n{holder_examples}")
         if lockfile_present:
             log_ctx.log(f"  {tpu_name}: /tmp/libtpu_lockfile present")

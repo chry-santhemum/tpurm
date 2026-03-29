@@ -27,6 +27,8 @@ from .util_gcloud import gcloud_delete, gcloud_describe, gcloud_list, gcloud_sto
 from .util_log import LogContext
 from .util_ssh import check_setup, check_vacancy, kill_remote_processes
 
+STEAL_FAMILY_PRIORITY = {"v6e": 3, "v5p": 2, "v5e": 1}
+
 
 
 def tpu_matches_job(tpu: TPU, job: Job) -> bool:
@@ -97,7 +99,7 @@ def checkpoint_glob(job: Job, tpu: TPU) -> str:
 
 def has_checkpoint(job: Job, tpu: TPU, *, log_ctx: LogContext) -> bool:
     paths = gcloud_storage_ls(checkpoint_glob(job, tpu), log_ctx=log_ctx)
-    return len(paths) > 0
+    return any(path.rstrip("/").rsplit("/", 1)[-1] != "_INIT" for path in paths)
 
 
 def sync_state(file_state: Filestate, *, log_ctx: LogContext, startup: bool=False):
@@ -475,7 +477,13 @@ class Scheduler:
             for tpu in vacant_tpus:
                 owner_freq[tpu.owner] = owner_freq.get(tpu.owner, 0) + 1
             log_ctx.log(f"Vacant TPU owners frequency: {owner_freq}")
-            vacant_tpus.sort(key=lambda tpu: owner_freq[tpu.owner], reverse=True)
+            vacant_tpus.sort(
+                key=lambda tpu: (
+                    owner_freq[tpu.owner],
+                    STEAL_FAMILY_PRIORITY.get(tpu.family, 0),
+                ),
+                reverse=True,
+            )
 
             if vacant_tpus:
                 self._steal_target = (vacant_tpus[0], time.time())
@@ -530,7 +538,6 @@ class Scheduler:
         log_path = self.log_dir / f"job_{job_id}.log"
         with open(log_path, "a") as log_file:
             log_ctx = LogContext(log_file)
-            log_ctx.log(f"[job {job_id}] Launching on {tpu_name}...", force_print=True)
 
             fs = self.file_state
             with fs.transact():
@@ -567,7 +574,8 @@ class Scheduler:
                         log_ctx.log(f"[job {job_id}] cancelled after match.", force_print=True)
                         tracked_job.assigned_tpu = None
                 return
-
+            
+            log_ctx.log(f"[job {job_id}] Launching job {tracked_job.run_name} on {tpu_name}...", force_print=True)
             returncode = launch(
                 mt.tpu, job.command, stage_dir=job.stage_dir,
                 run_name=job.run_name, project_name=job.project_name,
