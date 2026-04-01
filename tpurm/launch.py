@@ -1,5 +1,6 @@
 import os
 import shlex
+import getpass
 import textwrap
 from pathlib import Path
 
@@ -28,7 +29,7 @@ def launch(
     The command string may contain the strings `{log_dir}`, `{run_name}`, or `{project_name}`
     which will be replaced with the corresponding arguments.
     """
-    stage_dir_suffix = stage_dir.split("/staging/")[-1]
+    stage_dir_suffix = stage_dir.split(f"/staging/{getpass.getuser()}/")[-1]
     if log_dir is None:
         log_dir = stage_dir_to_log_dir(stage_dir)
     os.makedirs(log_dir, exist_ok=True)

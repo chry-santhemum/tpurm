@@ -9,7 +9,7 @@ from pathlib import Path, PurePosixPath
 from .globals import REPO_ROOT, REMOTE_SCRIPTS_DIR, NFS_SSD_US
 from .util_log import run_cmd, LogContext
 
-RETENTION_DAYS = 7
+RETENTION_DAYS = 14
 
 def stage_dir_to_log_root(stage_dir: str, *, root: str = NFS_SSD_US) -> str:
     stage_dir_suffix = stage_dir.split("/staging/")[-1]

@@ -37,6 +37,7 @@ def gcloud_create(
         f"--accelerator-type={accelerator_type}",
         f"--version={runtime_version}",
         f"--service-account={service_account}",
+        "--labels=env=prod",
     ]
     if mode_flag:
         cmd.append(mode_flag)

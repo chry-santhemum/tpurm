@@ -335,7 +335,6 @@ class Scheduler:
                     if chosen is None:
                         curr_job_id = None
                         curr_combo.clear()
-                        curr_combo_pointer = 0
                         log_ctx.log(f"[worker {worker_id}] No queued job has a valid allocation combination; sleeping.")
                         self._stop_event.wait(30)
                         continue
@@ -731,8 +730,14 @@ class Scheduler:
                     job.assigned_tpu = None
                     job.status = "queued"
                 else:
-                    excluded_tpus.add(tpu_name)
-                    if fs._tpus[tpu_name].status == "free":
+                    tpu_status = fs._tpus[tpu_name].status
+                    if tpu_status == "busy":
+                        log_ctx.log(f"[job {job.id}] TPU {tpu_name} no longer available while waiting; re-queueing.", force_print=True)
+                        job.assigned_tpu = None
+                        job.status = "queued"
+                    else:
+                        excluded_tpus.add(tpu_name)
+                    if tpu_status == "free":
                         to_launch.append((job.id, tpu_name))
             
             # Match queued jobs

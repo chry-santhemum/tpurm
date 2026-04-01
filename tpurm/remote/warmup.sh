@@ -77,6 +77,21 @@ run_check_all() {
 }
 
 
+wait_for_apt_locks() {
+  while sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1; do
+    echo "[worker] waiting for apt/dpkg lock release..."
+    sleep 5
+  done
+}
+
+
+repair_apt_state() {
+  wait_for_apt_locks
+  sudo dpkg --configure -a || true
+  sudo apt-get -o DPkg::Lock::Timeout=300 -y -f install >/dev/null || true
+}
+
+
 run_body() {
   if [ "$ACTION" = "check" ]; then
     run_check
@@ -101,31 +116,26 @@ run_body() {
 
   echo "[worker] $(hostname): preparing for $DATASET warmup..."
 
-  # Ensure stream/decompression tools exist; skip apt entirely on already-initialized TPUs.
+  # fineweb10B uses gcloud storage cp directly, so only the imagenet path needs these tools.
   missing_tools=()
-  command -v pv >/dev/null 2>&1 || missing_tools+=("pv")
-  command -v zstd >/dev/null 2>&1 || missing_tools+=("zstd")
+  if [ "$DATASET" = "imagenet" ]; then
+    command -v pv >/dev/null 2>&1 || missing_tools+=("pv")
+    command -v zstd >/dev/null 2>&1 || missing_tools+=("zstd")
+  fi
   if [ "${#missing_tools[@]}" -gt 0 ]; then
     export DEBIAN_FRONTEND=noninteractive
     APT_RETRIES=${APT_RETRIES:-20}
     ret=1
-    sudo dpkg --configure -a || true
-    sudo apt-get -y update >/dev/null || true
+    repair_apt_state
+    sudo apt-get -o DPkg::Lock::Timeout=300 -y update >/dev/null || true
     for attempt in $(seq 1 "$APT_RETRIES"); do
       echo "[worker] apt install attempt $attempt/$APT_RETRIES for ${missing_tools[*]}"
-      sudo apt-get -y install "${missing_tools[@]}" >/dev/null && ret=0 || ret=$?
+      sudo apt-get -o DPkg::Lock::Timeout=300 -y install "${missing_tools[@]}" >/dev/null && ret=0 || ret=$?
       if [ "$ret" -eq 0 ]; then
         break
       fi
-      echo '[worker] apt install failed, cleaning stale locks and retrying...'
-      for f in /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock; do
-        pids="$(sudo lsof -t "$f" 2>/dev/null || true)"
-        if [ -n "$pids" ]; then
-          sudo kill -9 $pids >/dev/null 2>&1 || true
-        fi
-      done
-      sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock || true
-      sudo dpkg --configure -a || true
+      echo '[worker] apt install failed, repairing apt state and retrying...'
+      repair_apt_state
       sleep 5
     done
     if [ "$ret" -ne 0 ]; then
