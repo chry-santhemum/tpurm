@@ -226,6 +226,7 @@ class Scheduler:
         init_workers: int,
         steal_wait: int,
         steal_max: int,
+        forbidden_owners: set[str] | None = None,
         tick_interval: int = 10,
         state_dir: Path = FILE_STATE_DIR,
     ):
@@ -236,6 +237,10 @@ class Scheduler:
         self.init_workers = init_workers
         self.steal_wait = steal_wait
         self.steal_max = steal_max
+        self.forbidden_owners = set(forbidden_owners or [])
+        self.forbidden_tpus: set[str] = set()
+        self.retryable_failures_by_tpu: dict[str, int] = {}
+        self.forbid_after_retryable_failures = 2
         self.tick_interval = tick_interval
         self.state_dir = state_dir
         self.log_dir = state_dir / "logs"
@@ -470,6 +475,8 @@ class Scheduler:
             vacant_tpus = [
                 tpu for tpu in vacant_tpus
                 if tpu.owner != "atticusw" and tpu.name not in tracked_names
+                and tpu.owner not in self.forbidden_owners
+                and tpu.name not in self.forbidden_tpus
             ]
             # Steal from the rich
             owner_freq = {}
@@ -642,6 +649,19 @@ class Scheduler:
                 tpu = job.assigned_tpu
                 assert tpu is not None
                 mt = fs._tpus.get(tpu.name)
+                if might_retry:
+                    count = self.retryable_failures_by_tpu.get(tpu.name, 0) + 1
+                    self.retryable_failures_by_tpu[tpu.name] = count
+                    log_ctx.log(
+                        f"[job {job.id}] retryable failure on {tpu.name} "
+                        f"({count}/{self.forbid_after_retryable_failures})"
+                    )
+                    if count >= self.forbid_after_retryable_failures and tpu.name not in self.forbidden_tpus:
+                        self.forbidden_tpus.add(tpu.name)
+                        log_ctx.log(
+                            f"[job {job.id}] forbidding TPU {tpu.name} for the rest of this scheduler run",
+                            force_print=True,
+                        )
                 if mt is not None:
                     mt.status = "busy"
                     if tpu_dead:
@@ -702,7 +722,14 @@ class Scheduler:
         self.drain_cancelled_jobs(log_ctx=log_ctx)
         sync_state(self.file_state, log_ctx=log_ctx)
 
-        tick, num_owned = self.summary()
+        tick, _ = self.summary()
+        _, tpus = self.file_state.snapshot()
+        num_owned = sum(
+            1 for tpu_name, mt in tpus.items()
+            if mt.owned
+            and tpu_name not in self.forbidden_tpus
+            and mt.tpu.owner not in self.forbidden_owners
+        )
         if tick != prev_tick:
             log_ctx.log(tick, force_print=True)
 
@@ -717,7 +744,10 @@ class Scheduler:
         fs = self.file_state
         launches: list[tuple[int, str]] = []
         with fs.transact():
-            excluded_tpus = set()  # TPUs that already have matched jobs
+            excluded_tpus = set(self.forbidden_tpus)
+            for tpu_name, mt in fs._tpus.items():
+                if mt.tpu.owner in self.forbidden_owners:
+                    excluded_tpus.add(tpu_name)
             to_launch: list[tuple[int, str]] = []  # (job_id, tpu_name) to launch this turn
 
             # Check on jobs with "waiting" status
@@ -730,15 +760,19 @@ class Scheduler:
                     job.assigned_tpu = None
                     job.status = "queued"
                 else:
-                    tpu_status = fs._tpus[tpu_name].status
-                    if tpu_status == "busy":
+                    mt = fs._tpus[tpu_name]
+                    if tpu_name in self.forbidden_tpus or mt.tpu.owner in self.forbidden_owners:
+                        log_ctx.log(f"[job {job.id}] TPU {tpu_name} is forbidden; re-queueing.", force_print=True)
+                        job.assigned_tpu = None
+                        job.status = "queued"
+                    elif mt.status == "busy":
                         log_ctx.log(f"[job {job.id}] TPU {tpu_name} no longer available while waiting; re-queueing.", force_print=True)
                         job.assigned_tpu = None
                         job.status = "queued"
                     else:
                         excluded_tpus.add(tpu_name)
-                    if tpu_status == "free":
-                        to_launch.append((job.id, tpu_name))
+                        if mt.status == "free":
+                            to_launch.append((job.id, tpu_name))
             
             # Match queued jobs
             num_stolen_jobs = count_stolen_jobs(fs._jobs, fs._tpus)
@@ -806,6 +840,8 @@ class Scheduler:
         with open(log_path, "a") as log_file:
             log_ctx = LogContext(log_file)
             log_ctx.log("Scheduler starting...", force_print=True)
+            if self.forbidden_owners:
+                log_ctx.log(f"Forbidden TPU owners: {sorted(self.forbidden_owners)}", force_print=True)
             self.startup(log_ctx=log_ctx)
 
             log_ctx.log(f"Starting {self.alloc_workers} alloc workers: sizes {self.alloc_sizes}, regions {self.alloc_regions}", force_print=True)

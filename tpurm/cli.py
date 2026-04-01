@@ -176,6 +176,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_argument("--alloc-regions", nargs="+", default=None)
     sub.add_argument("--alloc-workers", type=int, default=None, help="Defaults to alloc_max")
     sub.add_argument("--init-workers", type=int, default=None, help="Defaults to alloc_max")
+    sub.add_argument("--forbid-owner", nargs="+", default=[], help="Do not match or steal TPUs owned by these users")
 
     # stop
     subparsers.add_parser("stop", help="Gracefully stop the daemon")
@@ -233,6 +234,7 @@ def main(argv: list[str] | None = None) -> int:
             init_workers=args.init_workers,
             steal_wait=args.steal_wait,
             steal_max=args.steal_max,
+            forbidden_owners=set(args.forbid_owner),
         )
         scheduler.run()
 
