@@ -25,7 +25,7 @@ from .staging import stage_dir_to_log_dir
 from .tpu import TPU, TPU_CONFIGS, zone_to_region, name_to_tpu, size_to_family
 from .util_gcloud import gcloud_delete, gcloud_describe, gcloud_list, gcloud_storage_ls
 from .util_log import LogContext
-from .util_ssh import check_setup, check_vacancy, kill_remote_processes
+from .util_ssh import check_setup, check_vacancy, kill_remote_processes, remote_reservation
 
 STEAL_FAMILY_PRIORITY = {"v6e": 3, "v5p": 2, "v5e": 1}
 
@@ -290,6 +290,8 @@ class Scheduler:
         log_ctx.log(f"[worker {worker_id}] Allocated {tpu.name} in {zone}", force_print=True)
         with self.file_state.transact():
             self.file_state._tpus[tpu.name] = ManagedTPU(tpu=tpu, owned=True, status="need_init")
+        if not remote_reservation(tpu.name, tpu.zone, "start", log_ctx=log_ctx):
+            log_ctx.log(f"[worker {worker_id}] Failed to start reservation on {tpu.name}")
         return True
 
         
@@ -352,7 +354,17 @@ class Scheduler:
         tpu = mt.tpu
         skip_upgrade = not mt.owned
 
-        if ensure_ready(tpu, skip_upgrade=skip_upgrade, log_ctx=log_ctx):
+        if mt.owned and not remote_reservation(tpu.name, tpu.zone, "start", log_ctx=log_ctx):
+            log_ctx.log(f"[worker {worker_id}] Failed to start reservation on {tpu.name}")
+
+        ready = ensure_ready(tpu, skip_upgrade=skip_upgrade, log_ctx=log_ctx)
+        stop_ok = True
+        if mt.owned:
+            stop_ok = remote_reservation(tpu.name, tpu.zone, "stop", log_ctx=log_ctx)
+            if not stop_ok:
+                log_ctx.log(f"[worker {worker_id}] Failed to stop reservation on {tpu.name}")
+
+        if ready and stop_ok:
             log_ctx.log(f"[worker {worker_id}] Successfully initialized: {tpu.name}", force_print=True)
             with self.file_state.transact():
                 self.file_state._tpus[tpu.name] = ManagedTPU(tpu=tpu, owned=mt.owned, status="free")

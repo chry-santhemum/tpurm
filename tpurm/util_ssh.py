@@ -173,6 +173,37 @@ def kill_remote_processes(
     return False
 
 
+def remote_reservation(
+    tpu_name: str,
+    zone: str,
+    action: str,
+    *,
+    log_ctx: LogContext,
+    timeout: float = 60,
+    max_ssh_tries: int = 2,
+) -> bool:
+    script = read_remote_script("reserve.sh").rstrip()
+    remote_cmd = f"ACTION={shlex.quote(action)} bash -s <<'REMOTE_SCRIPT'\n{script}\nREMOTE_SCRIPT"
+    result = gcloud_ssh(
+        tpu_name,
+        zone,
+        remote_cmd,
+        operation=f"reservation_{action}",
+        worker="all",
+        timeout=timeout,
+        max_ssh_tries=max_ssh_tries,
+        capture_output=False,
+        log_ctx=log_ctx,
+    )
+    if result.ok:
+        return True
+    log_ctx.log(
+        f"Reservation {action} failed on {tpu_name}: "
+        f"exit code {result.returncode}. Logs: {result.log_dir}"
+    )
+    return False
+
+
 # Helpers for checking if a TPU is ready to launch jobs
 
 _SETUP_MARKER = "__TPURM_SETUP__"
