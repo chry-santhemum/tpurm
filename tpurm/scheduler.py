@@ -94,12 +94,14 @@ def allocation_combos(tpu_sizes: list[str], regions: list[str] | None) -> list[t
         combos.extend((size, zone) for zone in allowed_zones)
     return combos
 
-def checkpoint_glob(job: Job, tpu: TPU) -> str:
-    return f"{tpu.bucket}/atticusw/checkpoints/{job.project_name}/{job.run_name}/*"
-
 def has_checkpoint(job: Job, tpu: TPU, *, log_ctx: LogContext) -> bool:
-    paths = gcloud_storage_ls(checkpoint_glob(job, tpu), log_ctx=log_ctx)
-    return any(path.rstrip("/").rsplit("/", 1)[-1] != "_INIT" for path in paths)
+    return any(
+        path.rstrip("/").rsplit("/", 1)[-1] != "_INIT"
+        for path in gcloud_storage_ls(
+            f"{tpu.bucket}/atticusw/checkpoints/jax-gpt/{job.run_name}/*",
+            log_ctx=log_ctx,
+        )
+    )
 
 
 def sync_state(file_state: Filestate, *, log_ctx: LogContext, startup: bool=False):

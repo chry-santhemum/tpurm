@@ -57,11 +57,14 @@ dataset_mount_path_for() {
 
 run_check() {
   TARGET="$(dataset_mount_path)"
-  if test -d "$TARGET"; then
-    echo YES
-  else
-    echo NO
+  if [ "$DATASET" = "fineweb10B" ]; then
+    test -d "$TARGET" \
+      && compgen -G "$TARGET/fineweb_train_*.bin" >/dev/null \
+      && compgen -G "$TARGET/fineweb_val_*.bin" >/dev/null \
+      && echo YES || echo NO
+    return
   fi
+  test -d "$TARGET" && echo YES || echo NO
 }
 
 
