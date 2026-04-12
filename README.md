@@ -1,4 +1,4 @@
-# tpurm: TPU resource manager
+# tpurm: TPU Resource Manager
 
 To use:
 
