@@ -26,7 +26,7 @@ done
 
 # apt install nfs-common and python3.13
 export DEBIAN_FRONTEND=noninteractive
-APT_RETRIES=${APT_RETRIES:-20}
+APT_RETRIES=${APT_RETRIES:-2}
 ret=1
 for attempt in $(seq 1 $APT_RETRIES); do
     echo "[init.sh] apt init attempt $attempt/$APT_RETRIES"

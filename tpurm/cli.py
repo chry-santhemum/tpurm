@@ -129,6 +129,45 @@ def cancel_job(job_id: int, *, log_ctx: LogContext, state_dir: Path = FILE_STATE
             log_ctx.log(f"Error: Job {job_id} is already {job.status}.")
 
 
+def list_active_jobs(*, state_dir: Path = FILE_STATE_DIR):
+    fs = Filestate(state_dir)
+    jobs, _ = fs.snapshot()
+    rows = []
+    for job in jobs:
+        if job.status not in ("queued", "waiting", "running"):
+            continue
+        tpu = job.assigned_tpu
+        assigned_tpu = "-"
+        region = "any" if job.region is None else ",".join(job.region)
+        attempt_display = str(job.attempt) if job.max_att is None else f"{job.attempt}/{job.max_att}"
+        if tpu is not None:
+            assigned_tpu = tpu.name
+            region = tpu.region
+        rows.append({
+            "Job ID": str(job.id),
+            "Job Name": job.run_name,
+            "Assigned TPU": assigned_tpu,
+            "Region": region,
+            "Status": job.status,
+            "Attempt": attempt_display,
+        })
+
+    if not rows:
+        print("No active jobs.")
+        return
+
+    columns = ["Job ID", "Job Name", "Assigned TPU", "Region", "Status", "Attempt"]
+    widths = {
+        column: max(len(column), *(len(row[column]) for row in rows))
+        for column in columns
+    }
+    fmt = "  ".join(f"{{:{widths[column]}}}" for column in columns)
+    print(fmt.format(*columns))
+    print(fmt.format(*("-" * widths[column] for column in columns)))
+    for row in rows:
+        print(fmt.format(*(row[column] for column in columns)))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="TPU Job Scheduler")
     subparsers = parser.add_subparsers(dest="action")
@@ -153,6 +192,9 @@ def main(argv: list[str] | None = None) -> int:
     # cancel
     sub = subparsers.add_parser("cancel", help="Cancel a job")
     sub.add_argument("job_id", type=int)
+
+    # jobs
+    subparsers.add_parser("jobs", help="List active jobs")
 
     # kill
     sub = subparsers.add_parser("kill", help="Kill remote TPU processes by TPU name")
@@ -207,6 +249,8 @@ def main(argv: list[str] | None = None) -> int:
         resume_job(args.job_id, log_ctx=log_ctx)
     elif args.action == "cancel":
         cancel_job(args.job_id, log_ctx=log_ctx)
+    elif args.action == "jobs":
+        list_active_jobs()
     elif args.action == "kill":
         return 0 if kill_remote_processes(
             args.tpu_name,

@@ -209,7 +209,7 @@ def ensure_ready(tpu: TPU, skip_upgrade: bool = False, *, log_ctx: LogContext) -
         if not init_and_install(
             tpu,
             requirements_lock=requirements_lock,
-            max_attempts=5, settle_time=180,
+            max_attempts=2, settle_time=180,
             skip_upgrade=skip_upgrade,
             log_ctx=log_ctx,
         ):
