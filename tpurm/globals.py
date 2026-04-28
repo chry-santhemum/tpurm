@@ -17,7 +17,6 @@ def resolve_repo_root() -> Path:
     raise RuntimeError(f"Could not find git repo root: {cwd}")
 
 REPO_ROOT = resolve_repo_root()
-NFS_US = "/kmh-nfs-us-mount"
 NFS_SSD_US = "/kmh-nfs-ssd-us-mount"
 DEFAULT_SA_KEY_FILE: str = ENV_VARS["DEFAULT_SA_KEY_FILE"]  # type: ignore
 DEFAULT_KEYS_DIR: str = ENV_VARS["DEFAULT_KEYS_DIR"]  # type: ignore

@@ -112,6 +112,8 @@ log_bootstrap "starting $BOOTSTRAP_STAGE"
 sudo mkdir -p /tmp/tpu_logs
 sudo chown -R "$(id -un):$(id -gn)" /tmp/tpu_logs
 sudo chmod 755 /tmp/tpu_logs
+# Release the TPU-holder reservation in the same shell that starts training.
+ACTION=stop bash "$SCRIPT_DIR/reserve.sh" || true
 set +e
 # Avoid a tee pipeline here so the wrapper exits when the command exits.
 stdbuf -oL -eL bash -lc "$TRAIN_COMMAND" >> "$WORKER_LOG" 2>&1

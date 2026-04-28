@@ -47,12 +47,6 @@ if [ "$ret" -ne 0 ]; then
     exit 7
 fi
 
-# mount NFS (idempotent)
-sudo mkdir -p /kmh-nfs-us-mount
-mountpoint -q /kmh-nfs-us-mount || sudo mount -o vers=3 10.26.72.146:/kmh_nfs_us /kmh-nfs-us-mount
-sudo chmod go+rw /kmh-nfs-us-mount
-ls /kmh-nfs-us-mount
-
 sudo mkdir -p /kmh-nfs-ssd-us-mount
 mountpoint -q /kmh-nfs-ssd-us-mount || sudo mount -o vers=3 10.97.81.98:/kmh_nfs_ssd_us /kmh-nfs-ssd-us-mount
 sudo chmod go+rw /kmh-nfs-ssd-us-mount

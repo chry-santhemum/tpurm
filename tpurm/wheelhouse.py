@@ -50,6 +50,7 @@ def _run_remote_scripts(
     operation: str,
     worker: str,
     timeout: float | None,
+    capture_output: bool = False,
     log_ctx: LogContext,
 ):
     env_prefix = " ".join(f"{key}={shlex.quote(value)}" for key, value in env.items())
@@ -62,7 +63,7 @@ def _run_remote_scripts(
         operation=operation,
         worker=worker,
         timeout=timeout,
-        capture_output=False,
+        capture_output=capture_output,
         max_ssh_tries=3,
         log_ctx=log_ctx,
     )
@@ -73,14 +74,21 @@ def tarball_exists(tpu: TPU, requirements_hash: str, *, log_ctx: LogContext) -> 
     log_ctx.log(f"Checking if tarball exists: {uri}")
     result = _run_remote_scripts(
         tpu,
-        script_names=["gcloud_auth.sh", "wheelhouse_preamble.sh"],
+        script_names=["gcloud_auth.sh", "wheelhouse_preamble.sh", "wheelhouse_exists.sh"],
         env=_wheelhouse_env(tpu, requirements_hash=requirements_hash),
         operation="wheelhouse_exists",
         worker="0",
         timeout=60,
+        capture_output=True,
         log_ctx=log_ctx,
     )
-    return result.ok
+    if not result.ok:
+        log_ctx.log(
+            f"Wheelhouse existence check failed on {tpu.name}: "
+            f"exit {result.returncode}. Logs: {result.log_dir}"
+        )
+        return False
+    return "__TPURM_WHEELHOUSE_EXISTS__=1" in result.stdout
 
 
 def build(tpu: TPU, requirements_lock: str, wheelhouse_dir: str = "", *, log_ctx: LogContext) -> bool:

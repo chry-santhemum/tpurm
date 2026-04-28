@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TypedDict, cast, get_args
 
-from .globals import DatasetName, NFS_SSD_US, NFS_US, REMOTE_SCRIPTS_DIR, REPO_ROOT
+from .globals import DatasetName, NFS_SSD_US, REMOTE_SCRIPTS_DIR, REPO_ROOT
 from .tpu import name_to_tpu
 from .util_log import LogContext, run_cmd
 
@@ -196,12 +196,29 @@ def remote_reservation(
         log_ctx=log_ctx,
     )
     if result.ok:
+        if action == "start":
+            log_ctx.log(
+                f"Reservation process started on {tpu_name}. "
+                "Remote details: /tmp/tpurm_reserve.status and /tmp/tpurm_reserve.log"
+            )
         return True
     log_ctx.log(
         f"Reservation {action} failed on {tpu_name}: "
         f"exit code {result.returncode}. Logs: {result.log_dir}"
     )
     return False
+
+
+def drop_pid_lines(lines: list[str], ignored_pid: str | None, pid_index: int) -> list[str]:
+    """Drop process-report lines whose PID column matches `ignored_pid`."""
+    if ignored_pid is None:
+        return lines
+    out = []
+    for line in lines:
+        parts = line.split(None, pid_index + 1)
+        if len(parts) <= pid_index or parts[pid_index] != ignored_pid:
+            out.append(line)
+    return out
 
 
 # Helpers for checking if a TPU is ready to launch jobs
@@ -246,7 +263,6 @@ def check_setup(
         set -eu
         wid="${{TPU_WORKER_ID:-$(hostname)}}"
         env=1
-        mountpoint -q {shlex.quote(NFS_US)} || env=0
         mountpoint -q {shlex.quote(NFS_SSD_US)} || env=0
         python3.13 -m pip --version >/dev/null 2>&1 || env=0
         requirements=1
@@ -331,12 +347,21 @@ def check_vacancy(
     log_ctx: LogContext,
     timeout: float = 15,
     max_ssh_tries: int = 3,
+    ignore_tpurm_reserve: bool = False,
 ) -> tuple[bool, str] | None:
     """
     SSH into worker 0 and check if TPU is in use.
+    When `ignore_tpurm_reserve` is set, ignore the reservation process started by tpurm.
     `None` means the SSH call failed.
     """
     cmd = (
+        "reserve_pid=''; "
+        "if [ -f /tmp/tpurm_reserve.pid ]; then "
+        "reserve_pid=$(cat /tmp/tpurm_reserve.pid 2>/dev/null || true); "
+        "if [ -n \"$reserve_pid\" ] && ! kill -0 \"$reserve_pid\" >/dev/null 2>&1; then reserve_pid=''; fi; "
+        "fi; "
+        "echo \"$reserve_pid\"; "
+        "echo ---MARKER---; "
         "sudo lsof -w /dev/accel* /dev/vfio/* 2>/dev/null || true; "
         "echo ---MARKER---; "
         "if [ -e /tmp/libtpu_lockfile ]; then echo PRESENT; fi; "
@@ -359,14 +384,30 @@ def check_vacancy(
         return None
 
     parts = result.stdout.split("---MARKER---")
-    raw_holder_output = parts[0].strip() if len(parts) > 0 else ""
-    lockfile_output = parts[1].strip() if len(parts) > 1 else ""
-    python_output = parts[2].strip() if len(parts) > 2 else ""
-    load_output = parts[3].strip() if len(parts) > 3 else ""
+    reserve_pid_output = parts[0].strip() if len(parts) > 0 else ""
+    raw_holder_output = parts[1].strip() if len(parts) > 1 else ""
+    lockfile_output = parts[2].strip() if len(parts) > 2 else ""
+    raw_python_output = parts[3].strip() if len(parts) > 3 else ""
+    load_output = parts[4].strip() if len(parts) > 4 else ""
 
+    # gcloud ssh prepends connection-status lines before the echoed PID.
+    reserve_pid = None
+    for line in reversed(reserve_pid_output.splitlines()):
+        line = line.strip()
+        if line.isdigit():
+            reserve_pid = line
+            break
     holder_lines = [line for line in raw_holder_output.splitlines() if "/dev/accel" in line or "/dev/vfio" in line]
+    if ignore_tpurm_reserve:
+        holder_lines = drop_pid_lines(holder_lines, reserve_pid, pid_index=1)
     holder_output = "\n".join(holder_lines).strip()
+    python_lines = raw_python_output.splitlines()
+    if ignore_tpurm_reserve:
+        python_lines = drop_pid_lines(python_lines, reserve_pid, pid_index=0)
+    python_output = "\n".join(python_lines).strip()
     lockfile_present = lockfile_output == "PRESENT"
+    if ignore_tpurm_reserve and reserve_pid is not None:
+        lockfile_present = False
 
     tpu = name_to_tpu(tpu_name, zone)
     if tpu is not None:
@@ -377,7 +418,10 @@ def check_vacancy(
             holder_examples = "\n".join(holder_output.splitlines()[:2])
             log_ctx.log(f"  {tpu_name}: TPU holder examples:\n{holder_examples}")
         if lockfile_present:
-            log_ctx.log(f"  {tpu_name}: /tmp/libtpu_lockfile present")
+            if holder_output == "" and python_output == "":
+                log_ctx.log(f"  {tpu_name}: stale /tmp/libtpu_lockfile present; ignoring it")
+            else:
+                log_ctx.log(f"  {tpu_name}: /tmp/libtpu_lockfile present")
         log_ctx.log(f"  {tpu_name}: load output:\n{load_output}")
 
     load_parts = load_output.split()
@@ -390,7 +434,6 @@ def check_vacancy(
 
     vacant = (
         holder_output == ""
-        and not lockfile_present
         and python_output == ""
         and (load_5m < 2.0 or load_1m < 1.0)
     )

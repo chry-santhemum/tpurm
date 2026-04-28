@@ -44,15 +44,16 @@ def install_requirements(
     install_success = False
     assert tpu.num_workers is not None, "TPU must be allocated before initialization."
     if tpu.wheelhouse_tag and tpu.num_workers > 1:
-        if not wheelhouse.build(tpu, requirements_lock=requirements_lock, log_ctx=log_ctx):
-            log_ctx.log("Warning: wheelhouse build failed")
-        install_success = wheelhouse.install(
-            tpu,
-            requirements_lock=requirements_lock,
-            log_ctx=log_ctx,
-        )
-        if not install_success:
-            log_ctx.log("Warning: wheelhouse install failed; falling back to install.sh")
+        if wheelhouse.build(tpu, requirements_lock=requirements_lock, log_ctx=log_ctx):
+            install_success = wheelhouse.install(
+                tpu,
+                requirements_lock=requirements_lock,
+                log_ctx=log_ctx,
+            )
+            if not install_success:
+                log_ctx.log("Warning: wheelhouse install failed; falling back to install.sh")
+        else:
+            log_ctx.log("Warning: wheelhouse build failed; falling back to install.sh")
     if install_success:
         return True
     env_prefix = " ".join(f"{key}={shlex.quote(value)}" for key, value in install_env.items())

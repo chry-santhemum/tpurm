@@ -86,7 +86,8 @@ def name_to_tpu(name: str, zone: str) -> TPU | None:
     """
     Parse a VM name like `kmh-tpuvm-v6e-64-spot-atticusw-12345` into a TPU.
     The only requirement is the `kmh-tpuvm-{family}-{chips}` prefix.
-    Returns None if cannot be parsed.
+    Returns None if cannot be parsed, or if the discovered zone does not
+    match the TPU family's configured support zones.
     Mode defaults to `spot` when it can't be detected.
     The constructed TPU's `.name` is overridden with the actual VM name.
     """
@@ -94,6 +95,8 @@ def name_to_tpu(name: str, zone: str) -> TPU | None:
     if not m:
         return None
     family, chips, remainder = m.groups()
+    if zone not in TPU_CONFIGS[family]["allowed_zones"]:
+        return None
     size = f"{family}-{chips}"
     remainder = remainder or ""
 

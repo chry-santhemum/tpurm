@@ -17,6 +17,10 @@ fi
 ACTION="${ACTION:-warmup}"
 DATASET="${DATASET:-imagenet}"
 FINEWEB10B_SUFFIX="${FINEWEB10B_SUFFIX:-bin}"
+FINEWEB10B_EXPECTED_COUNT="${FINEWEB10B_EXPECTED_COUNT:-104}"
+FINEWEB10B_COPY_TIMEOUT="${FINEWEB10B_COPY_TIMEOUT:-600}"
+FINEWEB10B_COPY_POLL_SECS="${FINEWEB10B_COPY_POLL_SECS:-2}"
+FINEWEB10B_READY_STABLE_SECS="${FINEWEB10B_READY_STABLE_SECS:-2}"
 TMPFS_MOUNT="${TMPFS_MOUNT:-/mnt/atticusw}"
 TMPFS_SIZE="${TMPFS_SIZE:-270G}"
 CLEAN_DEST="${CLEAN_DEST:-true}"
@@ -58,10 +62,7 @@ dataset_mount_path_for() {
 run_check() {
   TARGET="$(dataset_mount_path)"
   if [ "$DATASET" = "fineweb10B" ]; then
-    test -d "$TARGET" \
-      && compgen -G "$TARGET/fineweb_train_*.bin" >/dev/null \
-      && compgen -G "$TARGET/fineweb_val_*.bin" >/dev/null \
-      && echo YES || echo NO
+    fineweb10b_ready "$TARGET" && echo YES || echo NO
     return
   fi
   test -d "$TARGET" && echo YES || echo NO
@@ -71,7 +72,13 @@ run_check() {
 run_check_all() {
   for dataset_name in imagenet fineweb10B; do
     target="$(dataset_mount_path_for "$dataset_name")"
-    if test -d "$target"; then
+    if [ "$dataset_name" = "fineweb10B" ]; then
+      if DATASET="$dataset_name" fineweb10b_ready "$target"; then
+        echo "__TPURM_DATASET_STATUS__ ${dataset_name}=1"
+      else
+        echo "__TPURM_DATASET_STATUS__ ${dataset_name}=0"
+      fi
+    elif test -d "$target"; then
       echo "__TPURM_DATASET_STATUS__ ${dataset_name}=1"
     else
       echo "__TPURM_DATASET_STATUS__ ${dataset_name}=0"
@@ -92,6 +99,48 @@ repair_apt_state() {
   wait_for_apt_locks
   sudo dpkg --configure -a || true
   sudo apt-get -o DPkg::Lock::Timeout=300 -y -f install >/dev/null || true
+}
+
+
+fineweb10b_signature() {
+  find "$1" -maxdepth 1 -type f \
+    \( -name "fineweb_train_*.${FINEWEB10B_SUFFIX}" -o -name "fineweb_val_*.${FINEWEB10B_SUFFIX}" \) \
+    -size +0c -printf '%f:%s\n' 2>/dev/null | sort
+}
+
+
+fineweb10b_ready() {
+  local target="$1"
+  local first_sig=""
+  local second_sig=""
+  local file_count=0
+
+  [ -d "$target" ] || return 1
+  first_sig="$(fineweb10b_signature "$target")"
+  file_count="$(printf '%s\n' "$first_sig" | sed '/^$/d' | wc -l | tr -d ' ')"
+  [ "$file_count" -eq "$FINEWEB10B_EXPECTED_COUNT" ] || return 1
+  printf '%s\n' "$first_sig" | grep -q '^fineweb_train_' || return 1
+  printf '%s\n' "$first_sig" | grep -q '^fineweb_val_' || return 1
+
+  sleep "$FINEWEB10B_READY_STABLE_SECS"
+  second_sig="$(fineweb10b_signature "$target")"
+  [ "$first_sig" = "$second_sig" ]
+}
+
+
+stop_copy_process() {
+  local pid="$1"
+  local i=0
+
+  kill -TERM "-$pid" >/dev/null 2>&1 || kill -TERM "$pid" >/dev/null 2>&1 || true
+  for i in $(seq 1 5); do
+    kill -0 "-$pid" >/dev/null 2>&1 || break
+    sleep 1
+  done
+  if kill -0 "-$pid" >/dev/null 2>&1; then
+    kill -KILL "-$pid" >/dev/null 2>&1 || kill -KILL "$pid" >/dev/null 2>&1 || true
+  fi
+  wait "$pid" >/dev/null 2>&1 || true
 }
 
 
@@ -219,12 +268,46 @@ run_body() {
       exit 2
     fi
     echo "[worker] downloading fineweb10B *.${FINEWEB10B_SUFFIX} files from ${GCS_PREFIX} to ${RAMROOT}"
-    timeout 600s gcloud storage cp "${GCS_PREFIX}/*.${FINEWEB10B_SUFFIX}" "$RAMROOT/" && ret=0 || ret=$?
+    setsid gcloud storage cp "${GCS_PREFIX}/*.${FINEWEB10B_SUFFIX}" "$RAMROOT/" &
+    cp_pid=$!
+    deadline=$(($(date +%s) + FINEWEB10B_COPY_TIMEOUT))
+    ret=0
+    handled_copy=0
+
+    while jobs -r -p | grep -qx "$cp_pid"; do
+      if fineweb10b_ready "$RAMROOT"; then
+        echo "[worker] fineweb10B files validated; stopping gcloud storage cp"
+        stop_copy_process "$cp_pid"
+        handled_copy=1
+        ret=0
+        break
+      fi
+      if [ "$(date +%s)" -ge "$deadline" ]; then
+        echo "[worker] ERROR: gcloud storage cp did not finish within ${FINEWEB10B_COPY_TIMEOUT}s" >&2
+        stop_copy_process "$cp_pid"
+        ret=124
+        handled_copy=1
+        break
+      fi
+      sleep "$FINEWEB10B_COPY_POLL_SECS"
+    done
+
+    if [ "$handled_copy" -eq 0 ]; then
+      wait "$cp_pid" && ret=0 || ret=$?
+      if [ "$ret" -ne 0 ] && fineweb10b_ready "$RAMROOT"; then
+        echo "[worker] gcloud storage cp exited with code $ret after fineweb10B validation; treating warmup as complete"
+        ret=0
+      fi
+    fi
     if [ "$ret" -ne 0 ]; then
       echo "[worker] ERROR: gcloud storage cp failed with code $ret" >&2
       exit 27
     fi
-    num_files=$(ls "$RAMROOT"/*."${FINEWEB10B_SUFFIX}" 2>/dev/null | wc -l)
+    if ! fineweb10b_ready "$RAMROOT"; then
+      echo "[worker] ERROR: fineweb10B files failed validation after warmup" >&2
+      exit 27
+    fi
+    num_files="$FINEWEB10B_EXPECTED_COUNT"
     echo "[worker] downloaded ${num_files} fineweb10B files"
   else
     echo "[worker] ERROR: unsupported dataset '$DATASET'" >&2
@@ -242,6 +325,10 @@ if [ "$EUID" -ne 0 ] && [ "$ACTION" = "warmup" ]; then
   exec sudo env \
     ACTION="$ACTION" DATASET="$DATASET" \
     GCS_PREFIX="${GCS_PREFIX:-}" BASE="${BASE:-}" FINEWEB10B_SUFFIX="$FINEWEB10B_SUFFIX" \
+    FINEWEB10B_EXPECTED_COUNT="$FINEWEB10B_EXPECTED_COUNT" \
+    FINEWEB10B_COPY_TIMEOUT="$FINEWEB10B_COPY_TIMEOUT" \
+    FINEWEB10B_COPY_POLL_SECS="$FINEWEB10B_COPY_POLL_SECS" \
+    FINEWEB10B_READY_STABLE_SECS="$FINEWEB10B_READY_STABLE_SECS" \
     TMPFS_MOUNT="$TMPFS_MOUNT" TMPFS_SIZE="$TMPFS_SIZE" \
     DEST="${DEST:-}" CLEAN_DEST="$CLEAN_DEST" \
     SERVICE_ACCOUNT="$SERVICE_ACCOUNT" SA_KEY_FILE="$SA_KEY_FILE" \

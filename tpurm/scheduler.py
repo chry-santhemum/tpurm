@@ -168,7 +168,13 @@ def sync_state(file_state: Filestate, *, log_ctx: LogContext, startup: bool=Fals
             setup = check_setup(tpu_name, zone, log_ctx=log_ctx, max_ssh_tries=1)
             if setup is not None:
                 out["datasets"] = setup["datasets"]
-            vacant_ok = check_vacancy(tpu_name, zone, log_ctx=log_ctx, max_ssh_tries=1)
+            vacant_ok = check_vacancy(
+                tpu_name,
+                zone,
+                log_ctx=log_ctx,
+                max_ssh_tries=1,
+                ignore_tpurm_reserve=True,
+            )
             unknowns = int(setup is None) + int(vacant_ok is None)
             if vacant_ok is None:
                 out["status"] = "untrack" if unknowns >= 2 else "busy"
@@ -356,21 +362,18 @@ class Scheduler:
         tpu = mt.tpu
         skip_upgrade = not mt.owned
 
-        if mt.owned and not remote_reservation(tpu.name, tpu.zone, "start", log_ctx=log_ctx):
+        if not remote_reservation(tpu.name, tpu.zone, "start", log_ctx=log_ctx):
             log_ctx.log(f"[worker {worker_id}] Failed to start reservation on {tpu.name}")
 
         ready = ensure_ready(tpu, skip_upgrade=skip_upgrade, log_ctx=log_ctx)
-        stop_ok = True
-        if mt.owned:
-            stop_ok = remote_reservation(tpu.name, tpu.zone, "stop", log_ctx=log_ctx)
-            if not stop_ok:
-                log_ctx.log(f"[worker {worker_id}] Failed to stop reservation on {tpu.name}")
-
-        if ready and stop_ok:
+        if ready:
             log_ctx.log(f"[worker {worker_id}] Successfully initialized: {tpu.name}", force_print=True)
             with self.file_state.transact():
                 self.file_state._tpus[tpu.name] = ManagedTPU(tpu=tpu, owned=mt.owned, status="free")
             return True
+
+        if not remote_reservation(tpu.name, tpu.zone, "stop", log_ctx=log_ctx):
+            log_ctx.log(f"[worker {worker_id}] Failed to stop reservation on {tpu.name}")
 
         if mt.owned:
             log_ctx.log(f"[worker {worker_id}] Initialization failed. Deleting: {tpu.name}", force_print=True)
@@ -582,7 +585,13 @@ class Scheduler:
                 self.finalize_job(job, EXIT_CODE_SSH_RETRY)
                 return
 
-            info = check_vacancy(mt.tpu.name, mt.tpu.zone, log_ctx=log_ctx, max_ssh_tries=1)
+            info = check_vacancy(
+                mt.tpu.name,
+                mt.tpu.zone,
+                log_ctx=log_ctx,
+                max_ssh_tries=1,
+                ignore_tpurm_reserve=True,
+            )
             if info is None or not info[0]:
                 with fs.transact():
                     tracked_job = fs._jobs[job_id]
